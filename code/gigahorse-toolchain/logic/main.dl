@@ -1,0 +1,29 @@
+#define FALLBACK_FUNCTION_SIGHASH "0x00000000"
+
+
+
+/*
+ * Context sensitivity selection needs a little bit of macro expansion for generality
+ */
+
+#ifndef CONTEXT_SENSITIVITY
+  // TransactionalContext is default
+  #define CONTEXT_SENSITIVITY TransactionalContext
+//  #define CONTEXT_SENSITIVITY FinitePreciseContext
+//  #define CONTEXT_SENSITIVITY HybridPreciseContext
+#endif
+
+#include "context-sensitivity/context_sensitivity.dl"
+
+#include "global.dl"
+#include "functions.dl"
+#include "decompiler_output.dl"
+
+
+#ifndef NO_ANALYTICS
+#include "decompiler_analytics.dl"
+#endif
+
+#ifdef DEBUG
+#include "debug.dl"
+#endif

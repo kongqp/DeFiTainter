@@ -1,0 +1,60 @@
+#pragma once
+ 
+.comp ConstantFolding{
+
+  // API: This is what clients pass as input and get as output.
+  // 2-arg constant folding
+  .decl RequestConstantFold2(op: Opcode, arg1: Value, arg2: Value)
+  .decl ConstantFoldResult2(op: Opcode, arg1: Value, arg2: Value, result: Value)
+
+  .decl RequestConstantFold1(op: Opcode, arg: Value)
+
+  RequestConstantFold1(op, arg) :- RequestConstantFold1(op, arg). // suppress warning
+  .decl ConstantFoldResult1(op: Opcode, arg: Value, result: Value)
+
+  .decl ValidConstantFoldOperation(op: Opcode, arg1: Value, arg2: Value)
+  ValidConstantFoldOperation(op, arg1, arg2) :-
+    RequestConstantFold2(op, arg1, arg2),
+    ((op != "DIV", op != "SDIV", op != "MOD", op != "SMOD");
+     arg2 != "0x0").
+
+  // Not the most efficient because the string matching of the operator
+  // will happen last, but rule should fire rarely?
+  #define BINOP_SEMANTICS(_OP, _functor) \
+  ConstantFoldResult2(#_OP, arg1, arg2, as(result, Value)) :- \
+    ValidConstantFoldOperation(#_OP, arg1, arg2), \
+    result = _functor(arg1, arg2)
+
+  #define UNOP_SEMANTICS(_OP, _functor) \
+  ConstantFoldResult1(#_OP, arg, as(result, Value)) :- \
+    RequestConstantFold1(#_OP, arg), \
+    result = _functor(arg)
+
+  BINOP_SEMANTICS(ADD, @add_256).
+  BINOP_SEMANTICS(SUB, @sub_256).
+  BINOP_SEMANTICS(MUL, @mul_256).
+  BINOP_SEMANTICS(DIV, @div_256).
+  BINOP_SEMANTICS(MOD, @mod_256).
+  BINOP_SEMANTICS(AND, @and_256).
+  BINOP_SEMANTICS(OR, @or_256).
+  BINOP_SEMANTICS(XOR, @xor_256).
+  BINOP_SEMANTICS(GT, @gt_256).
+  BINOP_SEMANTICS(EQ, @eq_256).
+  BINOP_SEMANTICS(LT, @lt_256).
+  BINOP_SEMANTICS(EXP, @exp_256).
+  BINOP_SEMANTICS(SMOD, @smod_256).
+  BINOP_SEMANTICS(SDIV, @sdiv_256).
+  BINOP_SEMANTICS(SGT, @sgt_256).
+  BINOP_SEMANTICS(SLT, @slt_256).
+  BINOP_SEMANTICS(SHL, @shl_256).
+  BINOP_SEMANTICS(SHR, @shr_256).
+  BINOP_SEMANTICS(SAR, @sar_256).
+
+  UNOP_SEMANTICS(NOT, @not_256).
+
+  // constant-fold ISZERO as a special case of EQ
+  ConstantFoldResult1("ISZERO", arg, as(result, Value)) :-
+    RequestConstantFold1("ISZERO", arg),
+    result = @eq_256(arg, "0x0").
+}
+

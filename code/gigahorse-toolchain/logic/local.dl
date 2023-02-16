@@ -1,0 +1,885 @@
+#include "../clientlib/constants.dl"
+#include "statement_insertor.dl"
+
+// Convenience predicate. Folds together bounds checking on valid
+// indices and less-than.
+.decl IsStackIndexLessThan(n:StackIndex, maximum:StackIndex) inline
+                                                               
+IsStackIndexLessThan(n, maximum) :- n = range(0, maximum, 1).
+
+// All sorts of different outputs of the decompiler, including
+// three-address code representation (which is later input and
+// re-formatted for use by clients), statistics, debugging relations.
+.decl ByteCodeHex(bytecode:symbol)
+
+.decl _ByteCodeHex(bytecode:symbol)
+.input _ByteCodeHex(IO="file", filename="bytecode.hex")
+
+// strip '0x' from the start of the bytecode if present
+// keeping it would have all the uses of the bytecode wrong (handling codecopies)
+ByteCodeHex(bytecode):-
+  _ByteCodeHex(bytecode),
+  !contains("0x", bytecode).
+
+ByteCodeHex(substr(bytecode, 2, strlen(bytecode))):-
+  _ByteCodeHex(bytecode),
+  contains("0x", bytecode).
+ 
+// Local means within the same basic block
+.comp LocalAnalysis {
+
+  /*
+    Component Inputs
+  */
+
+  // `statement` pushes `value` to the stack
+  .decl PushValue(statement: Statement, value: Value)
+
+  .decl Statement_Opcode(statement: Statement, opcode: Opcode)
+
+  /**
+    A total order of the program's statements.
+    Originating from the order of the statements in the bytecode.
+  */
+  .decl Statement_Next(statement: Statement, statementNext: Statement)
+
+
+  #include "decompiler_input_statements.dl"
+
+  /**
+    Any input opcode that should not be present in the output
+    (three-address) code. These are mostly stack machine instructions,
+    which disappear. Other instructions (e.g., logical or arithmetic
+    operators) are maintained in the output but arguments are inferred.
+    Similarly, instructions can disappear from the output (e.g., a JUMP
+    may become a PRIVATECALL) but this is a property of an instance, not
+    the entire JUMP opcode.
+  */
+  .decl TACNOP(statement: Statement)
+  
+  TACNOP(stmt) :-
+    Statement_Opcode(stmt, opcode),
+    (OpcodeIsDup(opcode) ; OpcodeIsSwap(opcode)).
+
+  TACNOP(stmt) :- POP(stmt) ; JUMPDEST(stmt).
+  
+  .decl MissingStatement(stmt: Statement)
+  
+  MissingStatement(stmt) :-
+    Statement_Opcode(stmt, "MISSING").
+  
+  .decl DUPN(opcode:Opcode, n:number)
+
+  DUPN(opcode, dupn - dup1 + 1) :-
+    OpcodeOrd(opcode, dupn),
+    OpcodeIsDup(opcode),
+    OpcodeOrd("DUP1", dup1).
+  
+  .decl SWAPN(opcode:Opcode, n:number)
+
+  SWAPN(opcode, swapn - swap1 + 1) :-
+    OpcodeOrd(opcode, swapn),
+    OpcodeIsSwap(opcode),
+    OpcodeOrd("SWAP1", swap1).
+  
+  OpcodePopWords("CALLPRIVATE", 1).
+  OpcodePopWords("RETURNPRIVATE", 1).
+
+  .init variableValueConstantFolding = ConstantFolding
+
+  // Auxiliary relations for constant folding
+  .decl BinopStatementOpAndArgs(stmt: Statement, op: Opcode, a: Variable, b: Variable)
+  BinopStatementOpAndArgs(stmt, op, as(a, Variable), as(b, Variable)) :-
+    Statement_Opcode(stmt, op),
+    Statement_Uses_Local(stmt, a, 0),
+    Statement_Uses_Local(stmt, b, 1),
+    CheckIsVariable(a),
+    CheckIsVariable(b).
+
+  .decl BinopStatementOpAndConstantArgValues(stmt: Statement, op: Opcode, a_val: Value, b_val: Value)
+  BinopStatementOpAndConstantArgValues(stmt, op, a_val, b_val) :-
+    Variable_Value(a, a_val),
+    BinopStatementOpAndArgs(stmt, op, a, b),
+    Variable_Value(b, b_val).
+  .plan 1:(3,2,1)
+
+  .decl UnopStatementOpAndArgs(stmt: Statement, op: Opcode, a: Variable)
+  UnopStatementOpAndArgs(stmt, op, as(a, Variable)) :-
+    Statement_Opcode(stmt, op),
+    Statement_Uses_Local(stmt, a, 0),
+    !Statement_Uses_Local(stmt, _, 1),
+    CheckIsVariable(a).
+
+  .decl UnopStatementOpAndConstantArgValues(stmt: Statement, op: Opcode, a_val: Value)
+  UnopStatementOpAndConstantArgValues(stmt, op, a_val) :-
+    Variable_Value(a, a_val),
+    UnopStatementOpAndArgs(stmt, op, a).
+
+  // Constant fold of variables holding unique constant numeric values
+  variableValueConstantFolding.RequestConstantFold2(op, a_val, b_val) :-
+    BinopStatementOpAndConstantArgValues(_, op, a_val, b_val).
+
+  variableValueConstantFolding.RequestConstantFold1(op, a_val) :-
+    UnopStatementOpAndConstantArgValues(_, op, a_val).
+
+  .decl Variable_Value(variable: Variable, value: Value)
+
+  Variable_Value(to, result) :-
+    variableValueConstantFolding.ConstantFoldResult2(op, a_val, b_val, result),
+    BinopStatementOpAndConstantArgValues(stmt, op, a_val, b_val),
+    Statement_Defines(stmt, to).
+   .plan 1:(2,1,3)
+
+  Variable_Value(to, result) :-
+    variableValueConstantFolding.ConstantFoldResult1(op, a_val, result),
+    UnopStatementOpAndConstantArgValues(stmt, op, a_val),
+    Statement_Defines(stmt, to).
+    
+  .decl IsVariable(n:Variable)
+  
+  // One to one mapping. Give every statement a unique var (negative index)
+  .decl Statement_Defines(statement: Statement, variable: Variable)
+  
+  .decl _StatementNum(statement: Statement, num: number)
+  
+  _StatementNum(stmt, -res-1) :-
+     Statement_Opcode(stmt, _),
+     res = @hex_to_number(stmt).
+  
+  
+  // We pre-assign variables to every statement except if they are
+  // not really creating new values on the stack (e.g. no pushes or simple swaps)
+  IsVariable(var),
+  Statement_Defines(stmt, var) :-
+    _StatementNum(stmt, n),
+    Statement_Opcode(stmt, opcode),
+    OpcodePushWords(opcode, m), m > 0,
+    !TACNOP(stmt),
+    var = as(n, Variable).
+
+
+  /*
+   ***********
+   * Define basic blocks
+   ***********
+   */
+
+  /**
+    Textbook material.
+    A basic block starts:
+      - at a label
+      - after a jump.
+    A basic block ends:
+      - at a jump
+      - before a label.
+  */
+  .decl IsBasicBlockHead(statement:Statement)
+  IsBasicBlockHead(statement) :-
+    JUMPDEST(statement).
+  
+  IsBasicBlockHead(statement) :-
+    JUMPI(prevStatement),
+  //// REVIEW: check that this is equivalent
+  //  Statement_Opcode(prevStatement, opcode),
+  //  OpcodeAltersFlow(opcode),
+    Statement_Next(prevStatement, statement).
+  
+  IsBasicBlockHead(statement) :-
+    Statement_Opcode(statement, _),
+    !Statement_Next(_, statement).  
+  
+  // Heuristic to separate code from data:
+  // Anything in a basic block after an instruction that alters flow or
+ // an invalid opcode is data.
+  .decl PossiblyIsBasicBlockTail(statement:Statement)
+  
+  PossiblyIsBasicBlockTail(statement) :-
+    Statement_Opcode(statement, opcode),
+    OpcodeAltersFlow(opcode).
+  
+  PossiblyIsBasicBlockTail(statement) :-
+    Statement_Next(statement, labelstatement),
+    JUMPDEST(labelstatement).
+  
+  PossiblyIsBasicBlockTail(statement) :-
+    MissingStatement(statement).
+  
+  .decl Statement_Block(statement:Statement, block:Block)
+  .decl Statement_BlockHead(statement:Statement, head:Statement)
+  
+  Statement_BlockHead(stmt, stmt),
+  Statement_Block(stmt, as(stmt, Block)) :-
+    IsBasicBlockHead(stmt).
+  
+  Statement_BlockHead(stmt, as(block, Statement)),
+  Statement_Block(stmt, block) :-
+    Statement_Block(prevstmt, block),
+    Statement_Next(prevstmt, stmt),
+    !IsBasicBlockHead(stmt),
+    !PossiblyIsBasicBlockTail(prevstmt).
+  
+  .decl BasicBlock_Head(block:Block, head:Statement)
+  BasicBlock_Head(block, head):-
+    Statement_BlockHead(stmt, head),
+    Statement_Block(stmt, block).
+  
+  .decl BasicBlock_Tail(block:Block, tail:Statement)
+  
+  BasicBlock_Tail(block, tail) :-
+     Statement_Block(tail, block),
+     Statement_Next(tail, next),
+     !Statement_Block(next, block).
+  
+  BasicBlock_Tail(block, tail) :-
+     Statement_Block(tail, block),
+     !Statement_Next(tail, _).
+  
+  .decl ValidStatement(stmt: Statement)
+  
+  ValidStatement(stmt) :- Statement_Block(stmt, _).
+  
+
+  /**
+    A summary of all the effects of the basic block up to a statement. The
+    summary cannot contain only variables, it will also refer symbolically to
+    other locations (stackIndexes) on the stack at the beginning of the basic block.
+  */
+  .decl LocalStackContents(stmt: Statement, index: StackIndex, variable: VariableOrStackIndex)
+
+  .decl BeforeLocalStackContents(stmt: Statement, n: StackIndex, variable: VariableOrStackIndex)
+
+  /**  
+    The target of a jump at the end of the `block` is a `variable` defined in
+    the `block` itself. "Immediate" is misnomer, can't think of better name.
+    This is a context-independent predicate.
+  */
+  .decl ImmediateBlockJumpTarget(block: Block, variable: Variable)
+
+  /**
+    How many items the basic `block` will pop from the stack that existed at
+    the beginning of its execution. I.e., how many items it will consume
+    from its caller. This is a high-watermark kind of measure: the consumed
+    data items may be replenished during execution, but we care about how high
+    the total will go.
+  */
+  .decl BlockPopDelta(block: Block, delta: number)
+
+  // What is the difference in stack height effected by the basic `block`
+  .decl BlockStackDelta(block: Block, delta: number)
+
+  // How many items a `statement` will pop from the stack
+  .decl StatementPopDelta(statement: Statement, delta: number)
+
+  // What is the difference in stack height after the execution of this `statement`
+  .decl StatementStackDelta(statement: Statement, delta: number)
+  
+  ImmediateBlockJumpTarget(block, as(var, Variable)) :-
+    BasicBlock_Tail(block, stmt),
+    IsJump(stmt),
+    BeforeLocalStackContents(stmt, 0, var),
+    CheckIsVariable(var).
+
+  .decl AlwaysJumps(stmt: Statement)
+  
+  AlwaysJumps(stmt) :-
+    JUMPI(stmt),
+    Statement_Uses_Local(stmt, pred, 1),
+    Variable_Value(pred, value),
+    value != "0x0".
+
+
+  // Covers JUMPIs and other fallthrough cases
+  .decl FallthroughStmt(stmt: Statement, next: Statement)
+
+  FallthroughStmt(stmt, next) :-
+    BasicBlock_Tail(_, stmt),
+    !JUMP(stmt),
+    Statement_Opcode(stmt, opcode),
+    !OpcodePossiblyHalts(opcode),
+    Statement_Next(stmt, next).
+
+
+  .decl ThrowJump(stmt: Statement)
+  
+  ThrowJump(jmp) :-
+     ImmediateBlockJumpTarget(block, variable),
+     Variable_Value(variable, targetValue),
+     !JUMPDEST(as(targetValue, Statement)),
+     BasicBlock_Tail(block, jmp).
+
+  /*
+   ***********
+   * Define semantics of instructions
+   ***********
+   */
+  // Variables unaffected by this instruction.
+  // Pop is modeled as a side-effect!
+  LocalStackContents(stmt, n + delta, varOrStackIndex) :-
+    BeforeLocalStackContents(stmt, n, varOrStackIndex),
+    Statement_Opcode(stmt, opcode),
+    OpcodeStackDelta(opcode, delta),
+    OpcodePopWords(opcode, numRemoved),
+    n >= numRemoved.
+  
+  // Base case, handles most cases
+  LocalStackContents(stmt, 0, var) :-
+    Statement_Defines(stmt, var),
+    !TACNOP(stmt).
+  
+  // Constant values. Example of implementation of push1 to push32.
+  Variable_Value(var, value) :-
+    PushValue(stmt, value),
+    Statement_Defines(stmt, var).
+  
+  // Get current program counter
+  Variable_Value(var, as(stmt, Value)) :-
+    PC(stmt),
+    Statement_Defines(stmt, var).
+
+  // DUP
+  LocalStackContents(stmt, 0, duplicated) :-
+    BeforeLocalStackContents(stmt, n-1, duplicated),
+    Statement_Opcode(stmt, opcode),
+    DUPN(opcode, n).
+  
+  LocalStackContents(stmt, m+1, other) :-
+    BeforeLocalStackContents(stmt, m, other),
+    Statement_Opcode(stmt, opcode),
+    DUPN(opcode, n),
+    IsStackIndexLessThan(m, n).
+
+  /**
+    Optimization: before local stack contents for swaps
+    It's quite useful to optimize this case.
+  */
+  .decl BeforeSwapLocalStackContents(stmt: Statement, n: number, m: StackIndex, variable: VariableOrStackIndex)
+  
+  BeforeSwapLocalStackContents(stmt, n, m, varOrStackIndex) :-
+    BeforeLocalStackContents(stmt, m, varOrStackIndex),
+    Statement_Opcode(stmt, opcode),
+    SWAPN(opcode, n).
+     
+  // SWAP
+  LocalStackContents(stmt, n, variable0),
+  LocalStackContents(stmt, 0, variableN) :-
+    BeforeSwapLocalStackContents(stmt, n, n, variableN),
+    BeforeSwapLocalStackContents(stmt, n, 0, variable0).
+    .plan 1:(2,1)
+  
+  LocalStackContents(stmt, m, other) :-
+    BeforeSwapLocalStackContents(stmt, n, m, other),
+    IsStackIndexLessThan(m, n), m > 0.
+  
+  /*
+   ***********
+   * Auxiliary relations: BeforeLocalStackContents
+   ***********
+   */
+  .decl NextStmtInBlock(stmt: Statement, nextStmt: Statement)
+  
+  NextStmtInBlock(prevStmt, stmt) :-
+    Statement_Next(prevStmt, stmt),
+    Statement_Block(prevStmt, block),
+    Statement_Block(stmt, block).
+  
+  // General case
+  BeforeLocalStackContents(stmt, n, variable) :-
+    LocalStackContents(prevStmt, n, variable),
+    NextStmtInBlock(prevStmt, stmt).
+  
+  // Special case for block head (contains only stackIndexes). Initialize all
+  // stack positions, from zero to max consumed (from the caller's stack) by
+  // the basic block. They are initialized to symbolic stackIndexes.
+  BeforeLocalStackContents(stmt, stackIndex, stackIndex) :-
+    IsBasicBlockHead(stmt),
+    Statement_Block(stmt, block),
+    BlockPopDelta(block, delta),
+    IsStackIndexLessThan(stackIndex, delta + 10).
+  
+   /*
+   ***********
+   * Auxiliary relations: block/statement pop deltas and total stack effects
+   ***********
+   */
+  
+  StatementStackDelta(stmt, delta) :-
+    IsBasicBlockHead(stmt),
+    Statement_Opcode(stmt, opcode),
+    OpcodeStackDelta(opcode, delta).
+  
+  StatementStackDelta(stmt, prevdelta + newdelta) :-
+    StatementStackDelta(prevstmt, prevdelta),
+    !BasicBlock_Tail(_, prevstmt),
+    Statement_Next(prevstmt, stmt),
+    Statement_Opcode(stmt, opcode),
+    OpcodeStackDelta(opcode, newdelta).
+  
+  // Need to keep a running maximum of elements consumed from the stack
+  // as it was at the beginning of the basic block.
+  StatementPopDelta(stmt, delta) :-
+    IsBasicBlockHead(stmt),
+    Statement_Opcode(stmt, opcode),
+    OpcodePopWords(opcode, delta).
+  
+  
+  StatementPopDelta(stmt, max(prevPopDelta, popDelta - prevStackDelta)) :-
+    StatementPopDelta(prevstmt, prevPopDelta),
+    !BasicBlock_Tail(_, prevstmt),
+    StatementStackDelta(prevstmt, prevStackDelta),
+    Statement_Next(prevstmt, stmt),
+    Statement_Opcode(stmt, opcode),
+    OpcodePopWords(opcode, popDelta).
+  
+  BlockStackDelta(block, delta) :-
+    BasicBlock_Tail(block, stmt),
+    StatementStackDelta(stmt, delta).
+  
+  BlockPopDelta(block, delta) :-
+    BasicBlock_Tail(block, stmt),
+    StatementPopDelta(stmt, delta).
+
+  .decl Statement_Uses_Local(stmt:Statement, var:VariableOrStackIndex, n:StackIndex)
+
+  Statement_Uses_Local(stmt, varOrStackIndex, n) :-
+     Statement_Opcode(stmt, opcode),
+     !TACNOP(stmt),
+     OpcodePopWords(opcode, m),
+     IsStackIndexLessThan(n, m),
+     BeforeLocalStackContents(stmt, n, varOrStackIndex).
+
+
+
+
+  .decl IsJump(stmt:Statement)
+
+  IsJump(stmt) :-
+    (JUMP(stmt); JUMPI(stmt)).
+
+
+  // Gas-related
+  .decl Statement_Gas(stmt: Statement, gas: number)
+
+  Statement_Gas(stmt, gas) :-
+     Statement_Opcode(stmt, opcode),
+     OpcodeGas(opcode, gas).
+
+  .decl PublicFunctionJump(block:Block, funHex: Value)
+  .decl PublicFunction(block:Block, funHex: Value)
+
+  // Code inserted by compiler to compare function signature
+  .decl BlockComparesSig(block: Block, sigHash: Value)
+
+  // Compares label from stack to a constant: common public function dispatch pattern
+  BlockComparesSig(block, sigHash) :-
+    Statement_Block(pushStmt, block),
+    ImmediateBlockJumpTarget(block, _),
+    (PUSH4(pushStmt, sigHash) ; PUSH3(pushStmt, sigHash)),
+    Statement_Defines(pushStmt, sigHashVar),
+    EQ(eqStmt),
+    Statement_Uses_Local(eqStmt, sigHashVar, _),
+    Statement_Defines(eqStmt, pred),
+    JUMPI(jumpiStmt),
+    Statement_Uses_Local(jumpiStmt, pred, 1).
+
+  .decl SWAPDUPPOPJUMPJUMPDESTOP(op: Opcode)
+  SWAPDUPPOPJUMPJUMPDESTOP(opcode):-
+    DUPN(opcode, _);
+    SWAPN(opcode, _);
+    opcode = "JUMP";
+    opcode = "JUMPDEST";
+    opcode = "POP".
+
+  /**
+    Often reused low-level blocks that only
+    alter the stack and/or consume statements
+  */
+  .decl StackBalanceBlock(block: Block)
+  StackBalanceBlock(block):-
+    Statement_Block(jump, block),
+    Statement_Opcode(jump, "JUMP"),
+    stackAltCount = count: {
+      Statement_Block(stmt, block), 
+      Statement_Opcode(stmt, op), 
+      SWAPDUPPOPJUMPJUMPDESTOP(op)
+    },
+    allCount = count: Statement_Block(_, block),
+    stackAltCount = allCount.
+
+  /**
+    Blocks that can lead to recursion, because their target
+    is pushed to the stack after they are executed
+  */
+  .decl NonImmediateBlockJumpTargetEscapes(block: Block)
+  DEBUG_OUTPUT(NonImmediateBlockJumpTargetEscapes)
+
+  NonImmediateBlockJumpTargetEscapes(block):-
+    IsJump(jump),
+    BasicBlock_Tail(block, jump),
+    BeforeLocalStackContents(jump, 0, var),
+    LocalStackContents(jump, _, var),
+    !ImmediateBlockJumpTarget(block, _).
+
+  /**
+    Block's "next" is always the same.
+    Helper for some ctx sensitivity algorithms
+  */
+  .decl BlockHasTrivialControl(block: Block)
+
+  BlockHasTrivialControl(block):-
+    BasicBlock_Tail(block, stmt),
+    !JUMP(stmt),
+    !JUMPI(stmt).
+
+  BlockHasTrivialControl(block):-
+    ImmediateBlockJumpTarget(block, _).
+}
+
+.comp PreTransLocalAnalysis : LocalAnalysis {
+
+  .decl CODECOPYSmallConst(codeCopy:Statement, const:symbol)
+
+  .decl CODECOPYSmallConstWLoad(codeCopy:Statement, const:symbol, load:Statement)
+
+  .decl CODECOPYSmallConstNoLoad(codeCopy:Statement, const:symbol)
+
+  CODECOPYSmallConstWLoad(codeCopy, const, mload):-
+    CODECOPYSmallConst(codeCopy, const),
+    BeforeLocalStackContents(codeCopy, 0, memLocVar),
+    CheckIsVariable(memLocVar),
+    Statement_Next(codeCopy, dupStmt),
+    Statement_Next(dupStmt, mload),
+    Statement_Opcode(mload, "MLOAD"),
+    BeforeLocalStackContents(mload, 0, memLocVar).
+
+  CODECOPYSmallConstNoLoad(codeCopy, const):-
+    CODECOPYSmallConst(codeCopy, const),
+    !CODECOPYSmallConstWLoad(codeCopy, const, _).
+
+  CODECOPYSmallConst(codeCopy, const):-
+    CODECOPYStatement(codeCopy, codeOffsetNumHex, smallNumHex),              
+    smallNum = @hex_to_number(smallNumHex),
+    smallNum <= 32,
+    codeOffsetNum = @hex_to_number(codeOffsetNumHex),
+    ByteCodeHex(bytecodeStr),
+    const = cat("0x", substr(bytecodeStr, 2*codeOffsetNum, 2*smallNum)).
+
+  .decl CODECOPYStatement(stmt: Statement, offset: Value, size: Value)
+
+  CODECOPYStatement(codeCopy, codeOffsetNumHex, smallNumHex) :-
+    Statement_Opcode(codeCopy, "CODECOPY"),
+    BeforeLocalStackContents(codeCopy, 2, lenVar),
+    CheckIsVariable(lenVar),
+    Statement_Defines(pushLen, lenVar),
+    PushValue(pushLen, smallNumHex),
+    BeforeLocalStackContents(codeCopy, 1, codeOffsetVar),
+    CheckIsVariable(codeOffsetVar),
+    Statement_Defines(pushCodeOffset, codeOffsetVar),
+    PushValue(pushCodeOffset, codeOffsetNumHex).
+
+
+  .decl BlockComparesSigVyper(block: Block, sigHash: Value)
+
+  BlockComparesSigVyper(block, sigHash) :-
+    Statement_Block(pushStmt, block),
+    (PUSH4(pushStmt, sigHash) ; PUSH3(pushStmt, sigHash)),
+    Statement_Defines(pushStmt, sigHashVar),
+    Statement_Uses_Local(eqStmt, sigHashVar, _),
+    EQ(eqStmt),
+    Statement_Defines(eqStmt, pred),
+    Statement_Uses_Local(isZeroStmt, pred, 0),
+    ISZERO(isZeroStmt),
+    Statement_Defines(isZeroStmt, negPred),
+    Statement_Uses_Local(jumpiStmt, negPred, 1),
+    JUMPI(jumpiStmt).
+
+  // New vyper pattern
+  BlockComparesSigVyper(block, sigHash) :-
+    Statement_Block(pushStmt, block),
+    (PUSH4(pushStmt, sigHash) ; PUSH3(pushStmt, sigHash)),
+    Statement_Defines(pushStmt, sigHashVar),
+    Statement_Uses_Local(xorStmt, sigHashVar, _),
+    XOR(xorStmt),
+    Statement_Defines(xorStmt, pred),
+    Statement_Uses_Local(jumpiStmt, pred, 1),
+    JUMPI(jumpiStmt).
+
+  PublicFunctionJump(block, sigHash) :-   BlockComparesSig(block, sigHash).
+
+  PublicFunction(as(targetValue, Block), sigHash) :-
+    BlockComparesSig(block, sigHash),
+    ImmediateBlockJumpTarget(block, var),
+    Statement_Defines(push, var),
+    PushValue(push, targetValue),
+    JUMPDEST(as(targetValue, symbol)).
+
+  .decl BlockComparesCallDataSizeToFour(block: Block, jumpi: Statement, target: Block)
+  .decl BlockJumpsOnCallDataSize(block: Block, jumpi: Statement, target: Block)
+  .decl BlockHasReceiveAsFallThrough(block: Block, jumpi: Statement, fallthrough:Statement, target: Block)
+
+  BlockComparesCallDataSizeToFour(block, stmt5, as(fallthrough, Block)):-
+    PushValue(stmt, "0x4"),
+    Statement_Next(stmt, stmt2),
+    CALLDATASIZE(stmt2),
+    Statement_Next(stmt2, stmt3),
+    LT(stmt3),
+    Statement_Next(stmt3, stmt4),
+    PushValue(stmt4, fallthrough),
+    Statement_Next(stmt4, stmt5),
+    JUMPI(stmt5),
+    Statement_Block(stmt5, block),
+    JUMPDEST(as(fallthrough, Statement)).
+
+  BlockJumpsOnCallDataSize(block, jumpi, as(fallthrough, Block)):-
+    CALLDATASIZE(cds),
+    Statement_Next(cds, push),
+    PushValue(push, fallthrough),
+    Statement_Next(push, jumpi),
+    JUMPI(jumpi),
+    Statement_Block(jumpi, block),
+    JUMPDEST(as(fallthrough, Statement)).
+
+  // Fallback functions
+  PublicFunctionJump(block, FALLBACK_FUNCTION_SIGHASH),
+  PublicFunction(fallbackStart, FALLBACK_FUNCTION_SIGHASH):-
+    BlockComparesCallDataSizeToFour(block, _, fallbackStart),
+    1 = count : BlockComparesCallDataSizeToFour(_, _, _),
+    !BlockJumpsOnCallDataSize(fallbackStart, _, _).
+
+  BlockHasReceiveAsFallThrough(block, jumpi, fallthrough, target):-
+    BlockComparesCallDataSizeToFour(_, _, block),
+    BlockJumpsOnCallDataSize(block, jumpi, target),
+    FallthroughStmt(jumpi, fallthrough).
+
+}
+
+.comp PostTransLocalAnalysis : LocalAnalysis {
+                                             
+}
+
+
+/**
+   Preprocessing of decompiler input, to yield convenient relations
+ */
+.comp StatementFactReader {                                         
+  .decl PushValue(stmt: Statement, v: Value)
+  .decl Statement_Opcode(statement: Statement, opcode: Opcode)
+  .decl Statement_Next(statement: Statement, statementNext: Statement)
+
+  .input PushValue(IO="file", filename="PushValue.facts")
+  .input Statement_Opcode(IO="file", filename="Statement_Opcode.facts")
+  .input Statement_Next(IO="file", filename="Statement_Next.facts")
+  
+}
+
+.init factReader = StatementFactReader
+
+/*
+ ***********
+ * Transformation-aided decompilation
+ ***********
+ */
+
+.init preTrans = PreTransLocalAnalysis
+
+.init revertCloner = RevertBlockCloner
+COPY_CODE(revertCloner, factReader)
+
+#ifdef BLOCK_CLONING
+// Enable the early cloning of blocks to increase precision (sacrificing performance)
+.init blockCloner = BLOCK_CLONING
+COPY_OUTPUT(blockCloner, revertCloner)
+blockCloner.Prev_Block_OriginalBlock(block, originalBlock):- revertCloner.Block_OriginalBlock(block, originalBlock).
+COPY_OUTPUT(preTrans, blockCloner)
+
+#else
+
+COPY_OUTPUT(preTrans, revertCloner)
+
+#endif
+
+INITIALIZE_STATEMENT_INSERTOR_FROM(insertor, preTrans, postTrans)
+
+
+// This one removes conditional calls
+insertor.removeOp(jumpStmt),
+insertor.removeOp(pushStmt),
+insertor.insertOps(pushStmt,
+  LIST(
+    STMT(PUSH4, MAKE_LABEL_REFERENCE(jumpDestStmt)),
+    STMT(JUMPI, "")
+  )
+),
+insertor.insertOps(jumpDestStmt,
+  LIST(
+    STMT(JUMPDEST, MAKE_LABEL_REFERENCE(jumpDestStmt)),
+    STMT(PUSH4, as(jumpDestStmt, symbol)),
+    STMT(JUMP, cat("PublicFunctionJump:", hash))
+  )
+) :-
+   preTrans.PublicFunctionJump(block, hash),
+   preTrans.PublicFunction(start, hash),
+   preTrans.Statement_Block(jumpDestStmt, start),
+   preTrans.JUMPDEST(jumpDestStmt),
+   preTrans.PushValue(pushStmt, as(jumpDestStmt, symbol)),
+   preTrans.Statement_Block(pushStmt, block),
+   preTrans.Statement_Defines(pushStmt, pushedVar),
+   preTrans.Statement_Uses_Local(jumpStmt, pushedVar, 0),
+   preTrans.BasicBlock_Tail(block, jumpStmt).
+
+// Vyper transformation
+insertor.insertOps(functionStartStmt,
+  LIST(
+    STMT(PUSH4, MAKE_LABEL_REFERENCE(hash)),
+    STMT(JUMP, cat("PublicFunctionJump:", hash)),
+    STMT(JUMPDEST, MAKE_LABEL_REFERENCE(hash))
+  )
+) :-
+   preTrans.BlockComparesSigVyper(block, hash),
+   preTrans.BasicBlock_Tail(block, tail),
+   preTrans.Statement_Next(tail, functionStartStmt),
+   !preTrans.BlockComparesSig(_, _).
+
+// Receive transformation
+insertor.insertOps(functionStartStmt,
+  LIST(
+    STMT(PUSH4, MAKE_LABEL_REFERENCE("0x00000000")),
+    STMT(JUMP, cat("PublicFunctionJump:", "0x00000000")),
+    STMT(JUMPDEST, MAKE_LABEL_REFERENCE("0x00000000"))
+  )
+) :-
+  preTrans.BlockHasReceiveAsFallThrough(_, _, functionStartStmt, _).
+
+// This one removes "throw jumps"
+insertor.removeOp(jmp),
+insertor.insertOps(jmp,
+  LIST(
+    STMT(POP, ""),
+    STMT(INVALID, "")
+  )
+) :-
+  preTrans.ThrowJump(jmp),
+  preTrans.JUMP(jmp).
+
+// This one removes conditional "throw jumps"
+// The old "target" was the invalid and the fallthrough
+// was the valid "next" block. So we create 2 labels
+// and add the "invalid" block after the old jumpi
+// and the JUMPDEST for the old valid "next" block right after it
+// We need to add this last JUMPDEST is because it was originally
+// a fallthrough block so it didn't need to start with a JUMPDEST
+// All this also requires adding ISZERO to reverse the condition.
+// Even if it did we don't break anything by adding an extra one.
+insertor.removeOp(jumpi),
+insertor.insertOps(jumpi,
+  LIST(
+    STMT(POP, ""),
+    STMT(ISZERO, ""),
+    STMT(PUSH4, MAKE_LABEL_REFERENCE(fallthrough)),
+    STMT(JUMPI, ""),
+    STMT(JUMPDEST, MAKE_LABEL_REFERENCE(jumpi)),
+    STMT(INVALID, ""),
+    STMT(JUMPDEST, MAKE_LABEL_REFERENCE(fallthrough))
+  )
+) :-
+  preTrans.ThrowJump(jumpi),
+  preTrans.JUMPI(jumpi),
+  preTrans.FallthroughStmt(jumpi, fallthrough).
+
+// This one removes conditional jumps that "always" jump
+insertor.removeOp(jmpi),
+insertor.insertOps(jmpi,
+  LIST(
+    STMT(SWAP1, ""),
+    STMT(POP, ""),
+    STMT(JUMP, "")
+  )
+) :-
+  preTrans.AlwaysJumps(jmpi).
+
+insertor.removeOp(codeCopy),
+insertor.removeOp(mload),
+insertor.insertOps(codeCopy,
+  LIST(
+    STMT(POP, ""),
+    STMT(POP, ""),
+    STMT(POP, "")
+  )
+),
+insertor.insertOps(mload,
+  LIST(
+    STMT(POP, ""),
+    STMT(PUSH32, const)
+  )
+) :-
+  preTrans.CODECOPYSmallConstWLoad(codeCopy, const, mload).
+
+insertor.removeOp(codeCopy),
+insertor.insertOps(codeCopy,
+  LIST(
+    STMT(SWAP2, ""),
+    STMT(POP, ""),
+    STMT(POP, ""),
+    STMT(PUSH32, const),
+    STMT(SWAP1, "")
+  )
+) :-
+  preTrans.CODECOPYSmallConstNoLoad(codeCopy, const).
+
+.init postTrans = PostTransLocalAnalysis
+
+// For Solidity, Vyper
+postTrans.PublicFunctionJump(block, substr(meta, 19, 30)) :-
+   insertor.MetaData(stmt, meta),
+   STARTSWITH(meta, "PublicFunctionJump:"),
+   postTrans.Statement_Block(stmt, block).
+
+// For Vyper
+postTrans.PublicFunction(block, hash) :-
+   insertor.MetaData(stmt, meta),
+   postTrans.JUMPDEST(stmt),
+   postTrans.Statement_Block(stmt, block),
+   preTrans.BlockComparesSigVyper(_, hash),
+   !preTrans.BlockComparesSig(_, _),
+   ISLABEL(meta), hash = GET_LABEL_REFERENCE(meta).
+
+// For receive functions
+postTrans.PublicFunction(block, hash) :-
+   preTrans.BlockHasReceiveAsFallThrough(_, _, _, _),
+   hash = "0x00000000",
+   hash = GET_LABEL_REFERENCE(meta), ISLABEL(meta),
+   insertor.MetaData(stmt, meta),
+   postTrans.JUMPDEST(stmt),
+   postTrans.Statement_Block(stmt, block).
+
+postTrans.PublicFunction(b, h) :- preTrans.PublicFunction(b, h).
+
+// Code chunking logic reserved for future EIP
+
+#define CHUNK_SIZE 31
+.type Chunk <: number
+
+.decl Statement_CodeChunkAccessed(s: Statement, c: Chunk)
+
+// Normal statement
+Statement_CodeChunkAccessed(stmt, @hex_to_number(stmt) / CHUNK_SIZE) :-
+  preTrans.Statement_Block(stmt, _).
+
+// Multi-byte instruction that crosses chunk borders
+Statement_CodeChunkAccessed(stmt, @hex_to_number(next_stmt) / CHUNK_SIZE) :-
+  preTrans.Statement_Block(stmt, _),
+  preTrans.Statement_Next(stmt, next_stmt),
+  (@hex_to_number(next_stmt) - 1) / CHUNK_SIZE != @hex_to_number(stmt) / CHUNK_SIZE.
+
+// Codecopy
+Statement_CodeChunkAccessed(stmt, n / CHUNK_SIZE) :-
+  preTrans.CODECOPYStatement(stmt, codeOffsetNumHex, lenHex),
+  codeOffset = @hex_to_number(codeOffsetNumHex),
+  len = @hex_to_number(lenHex),
+  n = range(codeOffset, codeOffset + len, 1).
+
+// Jumps to invalid addresses
+Statement_CodeChunkAccessed(stmt, @hex_to_number(targetValue) / CHUNK_SIZE) :-
+  preTrans.Statement_Block(stmt, block),
+  preTrans.ThrowJump(stmt), preTrans.JUMP(stmt),
+  preTrans.ImmediateBlockJumpTarget(block, variable),
+  preTrans.Variable_Value(variable, targetValue).

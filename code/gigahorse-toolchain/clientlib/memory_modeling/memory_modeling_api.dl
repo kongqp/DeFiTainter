@@ -1,0 +1,119 @@
+
+.type ArrayVariable <: Variable
+
+/**
+  Arrays can have many aliasing vars referencing them.
+  This relation maps a unique id for each "class" of aliasing arrays. 
+*/
+
+.decl VarIsArray(var: Variable, arrId: ArrayVariable)
+
+//.decl RegularArray(arrId:symbol)
+
+//.decl TightlyPackedArray(arrId:symbol)
+
+//.decl ABIEncodedArray(arrId:symbol)
+
+/**
+  elemSize is the width of the array's elements, can also be "??"
+*/
+.decl ArrayAllocation(arrId: ArrayVariable, elemSize: Value, arrayLength: Variable)
+
+/**
+  ArrayStore and ArrayLoad and the respective 'AtIndex relations do not overlap
+  The AtIndex relations map to high level stores and loads, while the others map to 
+  correspond to implicit array copying patterns. 
+**/
+
+.decl ArrayStore(stmt:Statement, arrId:ArrayVariable, from:Variable)
+
+.decl ArrayLoad(stmt:Statement, arrId:ArrayVariable, to:Variable)
+
+.decl ArrayStoreAtIndex(stmt:Statement, arrId:ArrayVariable, index:Variable, from:Variable)
+
+.decl ArrayLoadAtIndex(stmt:Statement, arrId:ArrayVariable, index:Variable, to:Variable)
+
+// Variable `lenVar` loads the length of array `arrId`.
+.decl ArrayLengthVar(arrId: ArrayVariable, lenVar: Variable)
+
+/**
+  Struct allocations.
+
+    @param  mstore      MSTORE statement updating the free memory pointer
+    @param  structBase  Variable pointing to the 0th word of the struct. Identifies the struct instance.
+    @param  wordWidth   Width of the struct in words
+*/
+.decl StructAllocation(mstore: Statement, structBase: Variable, wordWidth: number)
+DEBUG_OUTPUT(StructAllocation)
+
+.decl StructLoad(mload: Statement, structBase: Variable, wordOffset: number, loadedVar: Variable)
+DEBUG_OUTPUT(StructLoad)
+
+.decl StructStore(mstore: Statement, structBase: Variable, wordOffset: number, loadedVar: Variable)
+DEBUG_OUTPUT(StructStore)
+
+/**
+  NOTE:The `StatementUsesMemory_ActualMemoryArg` relation can be used
+  to get only the arguments passed through memory.
+
+  Actual arguments or uses for statements using memory,
+  this can combine memory and  non memory args (in LOGs and CALLs).
+  Producing results for:
+
+    LOGx statements,
+      The indexed args (1 for LOG1, 2 for LOG2, etc)
+      followed by the ABI encoded actual memory args
+
+    CALL statements have the following args,
+    all followed by the actual memory args:
+      CALL: gas, targetAddr, value
+      STATICCALL: gas, targetAddr
+      DELEGATECALL: gas, targetAddr
+    Note: In high level calls the function selector
+    is the 0th actual memory arg
+
+    SHA3:
+      The actual memory args.
+
+    RETURN:
+      The actual memory args, ABI encoded.
+
+    CALLDATALOAD:
+      The 0th actual arg is the array written to
+
+    MLOADS:
+      0th actual arg can be a var that will definitely be read from it
+      (that has been stored previously using MSTORE)
+*/
+
+.decl MemoryStatement_ActualArg(stmt: Statement, actual: Variable, index: number)
+
+.decl MemoryStatement_ActualArgNew(stmt: Statement, actual: MemoryArgument, index: number)
+
+/**
+  `actual` is the `index`'th actual return of external `call` 
+*/
+.decl ExternalCall_ActualReturn(call: Statement, actual: Variable, index: number)
+
+/**
+  External call `callStmt` has its entire call-data provided by a caller.
+*/
+.decl ArbitraryCall(call: Statement)
+
+/**
+  `arg` is the `index`'th formal argument of public function `pubFun`
+*/
+.decl PublicFunctionArg(pubFun: Function, arg: Variable, index: number)
+
+/**
+  Calldata `arrayArg` is the `index`'th formal argument of public function `pubFun`
+*/
+.decl PublicFunctionArrayArg(pubFun: Function, arrayArg: ArrayVariable, index: number)
+
+.type StatementOrLoop = Statement | Block
+
+/**
+  Statement or loop `loc` copies the value of array `from` to array `to`.  
+  __Note__: `to` can be `RawDataArray` right now. Perhaps not the best way to go.
+*/
+.decl ArrayCopy(loc: StatementOrLoop, from: ArrayVariable, to: ArrayVariable)

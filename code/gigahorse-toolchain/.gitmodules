@@ -1,0 +1,3 @@
+[submodule "souffle-addon"]
+	path = souffle-addon
+	url = git@github.com:plast-lab/souffle-addon.git 

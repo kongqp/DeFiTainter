@@ -1,0 +1,344 @@
+#include "../clientlib/decompiler_imports.dl"
+#include "../clientlib/loops_semantics.dl"
+#include "../clientlib/guards.dl"
+#include "../clientlib/vulnerability_macros.dl"
+
+// taint source
+.decl FLA_TaintedVar(funcSign:symbol, var:Variable)
+FLA_TaintedVar(funcSign, var) :-
+  CallToSignature(stmt, "balanceOf(address)"),
+  ExternalCall_ActualReturn(stmt, var, 0),
+  FLA_Statement_Function(stmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+FLA_TaintedVar(funcSign, var) :-
+  CallToSignature(stmt, "getReserves()"),
+  ExternalCall_ActualReturn(stmt, var, _),
+  FLA_Statement_Function(stmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+FLA_TaintedVar(funcSign, retVar) :-
+  CallToSignature(callStmt, "consult(address,uint256)"),
+  FLA_TaintedVar(_, var),
+  DataFlows(var,amount),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 2, amount),
+  ExternalCall_ActualReturn(callStmt, retVar, 0),
+  FLA_Statement_Function(callStmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+// tainted data flow into storage
+.decl FLA_TaintedSlot(slotNum:Value)
+FLA_TaintedSlot(slotNum) :-
+  FLA_TaintedVar(_, var1),
+  SSTORE(_, slotNumVar, var2),
+  Variable_Value(slotNumVar, slotNum),
+  DataFlows(var1, var2).
+
+FLA_TaintedSlot(slotNum) :-
+  CallToSignature(callStmt, "transferFrom(address,address,uint256)"),
+  PublicFunctionArg(_, funcArg, _),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 3, funcArg),
+  (PublicFunctionArg(_, var, _);CALLER(_, var);ORIGIN(_, var)),
+  DataFlows(var, sender),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 1, sender),
+  SLOAD(_, slotNumVar1, var1),
+  ADDFix(_, var1, funcArg, resVar),
+  Variable_Value(slotNumVar1, slotNum),
+  // DataFlows(funcArg, resVar),
+  SSTORE(_, slotNumVar2, resVar),
+  Variable_Value(slotNumVar2, slotNum).
+
+FLA_TaintedVar(funcSign, var) :-
+  FLA_TaintedSlot(slotNum),
+  SLOAD(stmt, slotNumVar, var),
+  Variable_Value(slotNumVar, slotNum),
+  FLA_Statement_Function(stmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+// tainted data flow into func return value
+.decl FLA_TaintedFuncRet(funcSign:symbol, retIndex:number, ret:Variable)
+.output FLA_TaintedFuncRet
+FLA_TaintedFuncRet(funcSign, retIndex, ret) :-
+  RETURN(retStmt, _, _),
+  FLA_Statement_Function(retStmt, func),
+  StatementUsesMemory_ActualMemoryArg(retStmt, _, retIndex, ret),
+  FLA_TaintedVar(_, var),
+  DataFlows(var, ret),
+  PublicFunctionSelector(func, funcSign).
+
+// tainted data flow into external call arg
+.decl FLA_TaintedCallArg(funcSign:symbol, callStmt:Statement, callArgIndex:number)
+.output FLA_TaintedCallArg
+FLA_TaintedCallArg(funcSign, callStmt, callArgIndex-1) :-
+  (CALL(callStmt, _, _, _, _, _, _, _, _);STATICCALL(callStmt, _, _, _, _, _, _, _);DELEGATECALL(callStmt, _, _, _, _, _, _, _)),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, callArgIndex, callArg),
+  callArgIndex != 0,
+  FLA_TaintedVar(_, var),
+  DataFlows(var, callArg),
+  Statement_Function(callStmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+// taint sink
+.decl FLA_SensitiveCall(callStmt:Statement, recipient:Variable, amount:Variable)
+FLA_SensitiveCall(callStmt, recipient, amount) :-
+  CallToSignature(callStmt, "transfer(address,uint256)"),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 1, recipient),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 2, amount).
+
+FLA_SensitiveCall(callStmt, recipient, amount) :-
+  CallToSignature(callStmt, "transferFrom(address,address,uint256)"),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 2, recipient),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 3, amount).
+
+FLA_SensitiveCall(callStmt, recipient, amount) :-
+  CallToSignature(callStmt, "_borrow(uint256,address)"),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 1, amount),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 2, recipient).
+
+FLA_SensitiveCall(callStmt, recipient, amount) :-
+  CallToSignature(callStmt, "_borrow(uint256,address)"),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 0, funcSign),
+  MLOADFreePtr_To(_, freePtr),
+  MSTORE(_, freePtr, funcSign),
+  ADDFix(_, freePtr, const1, storeAddr1),
+  Variable_Value(const1, a),
+  MSTORE(_, storeAddr1, amount),
+  ADDFix(_, freePtr, const2, storeAddr2),
+  Variable_Value(const2, b),
+  MSTORE(_, storeAddr2, recipient),
+  a > b.
+
+.decl FLA_SensitiveVar(funcSign:symbol, var:Variable)
+FLA_SensitiveVar(funcSign, amount) :-
+  FLA_SensitiveCall(stmt, recipient, amount),
+  (PublicFunctionArg(_, var, _);CALLER(_, var);ORIGIN(_, var)),
+  DataFlows(var, recipient),
+  FLA_Statement_Function(stmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+FLA_SensitiveVar(funcSign, amount) :-
+  (PublicFunctionArg(_, var, _);CALLER(_, var);ORIGIN(_, var)),
+  DataFlows(var, key),
+  SHA3_2ARG(_, key, _, def),
+  SSTORE(stmt, def, amount),
+  FLA_Statement_Function(stmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+FLA_SensitiveVar(funcSign, predicate) :-
+  ControlsWith(_, guardedBlock, predicate),
+  Statement_Block(callStmt, guardedBlock),
+  FLA_SensitiveCall(callStmt, _, amount),
+  FLA_SensitiveVar(funcSign, amount).
+
+// tainted data flow into taint sink
+.decl FLA_TaintedVarToSensitiveVar(funcSign:symbol, taintedVar:Variable, sensitiveVar:Variable)
+.output FLA_TaintedVarToSensitiveVar
+FLA_TaintedVarToSensitiveVar(funcSign, var1, var2) :-
+  FLA_TaintedVar(funcSign, var1),
+  !SLOAD(_, _, var1),
+  FLA_SensitiveVar(funcSign, var2),
+  FLA_SensitiveCall(_, _, var2),
+  DataFlows(var1, var2),
+  var1 != var2,
+  funcSign != "0x70a08231".
+
+// data from external call return value directly flow into taint sink
+.decl FLA_CallRetToSensitiveVar(funcSign:symbol, callStmt:Statement, callRetVar:Variable, callRetIndex:number, sensitiveVar:Variable)
+.output FLA_CallRetToSensitiveVar
+FLA_CallRetToSensitiveVar(funcSign, callStmt, callRetVar, callRetIndex, sensitiveVar) :-
+  ExternalCall_ActualReturn(callStmt, callRetVar, callRetIndex),
+  FLA_SensitiveVar(_, sensitiveVar),
+  DataFlows(callRetVar, sensitiveVar),
+  FLA_Statement_Function(callStmt, func),
+  PublicFunctionSelector(func, funcSign).
+
+FLA_CallRetToSensitiveVar(funcSign, callStmt, callRetVar, callRetIndex, sensitiveVar) :-
+  ExternalCall_ActualReturn(callStmt, callRetVar, callRetIndex),
+  JUMPI(_, _, sensitiveVar),
+  DataFlows(callRetVar, sensitiveVar),
+  FLA_Statement_Function(callStmt, func),
+  PublicFunctionSelector(func, funcSign),
+  funcSign = "0xda3d454c".
+
+// explicit spread from external call return value to func return 
+.decl FLA_Spread_CallRetToFuncRet(callStmt:Statement, callRet:Variable, callRetIndex:number, funcSign:symbol, funcRetIndex:number, funcRet:Variable)
+.output FLA_Spread_CallRetToFuncRet
+FLA_Spread_CallRetToFuncRet(callStmt, callRet, callRetIndex, funcSign, funcRetIndex, funcRet) :-
+  ExternalCall_ActualReturn(callStmt, callRet, callRetIndex),
+  RETURN(returnStmt, _, _),
+  Statement_Function(returnStmt, func),
+  StatementUsesMemory_ActualMemoryArg(returnStmt, _, funcRetIndex, funcRet),
+  DataFlows(callRet, funcRet),
+  PublicFunctionSelector(func, funcSign).
+
+// explicit spread from external call return value to external call arg
+.decl FLA_Spread_CallRetToCallArg(callStmt1:Statement, callRet:Variable, callRetIndex:number, callStmt2:Statement, callArgIndex:number, callArg:Variable)
+.output FLA_Spread_CallRetToCallArg
+FLA_Spread_CallRetToCallArg(callStmt1, callRet, callRetIndex, callStmt2, callArgIndex-1, callArg) :-
+  ExternalCall_ActualReturn(callStmt1, callRet, callRetIndex),
+  (CALL(callStmt2, _, _, _, _, _, _, _, _);STATICCALL(callStmt2, _, _, _, _, _, _, _);DELEGATECALL(callStmt2, _, _, _, _, _, _, _)),
+  StatementUsesMemory_ActualMemoryArg(callStmt2, _, callArgIndex, callArg),
+  callArgIndex != 0,
+  DataFlows(callRet, callArg).
+
+// explicit spread from pub func arg to external call arg
+.decl FLA_Spread_FuncArgToCallArg(funcSign:symbol, funcArgIndex:number, funcArg:Variable, callStmt:Statement, callArgIndex:number, callArg:Variable)
+.output FLA_Spread_FuncArgToCallArg
+FLA_Spread_FuncArgToCallArg(funcSign, funcArgIndex, funcArg, callStmt, callArgIndex-1, callArg) :-
+  PublicFunctionSelector(func, funcSign),
+  PublicFunctionArg(func, funcArg, funcArgIndex),
+  (CALL(callStmt, _, _, _, _, _, _, _, _);STATICCALL(callStmt, _, calleeVar, _, _, _, _, _);DELEGATECALL(callStmt, _, _, _, _, _, _, _)),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, callArgIndex, callArg),
+  callArgIndex != 0,
+  DataFlows(funcArg, callArg).
+
+// explicit spread from func arg to func ret
+.decl FLA_Spread_FuncArgToFuncRet(funcSign:symbol, funcArgIndex:number, funcArg:Variable, funcRetIndex:number, funcRet:Variable)
+.output FLA_Spread_FuncArgToFuncRet
+FLA_Spread_FuncArgToFuncRet(funcSign, funcArgIndex, funcArg, funcRetIndex, funcRet) :-
+  PublicFunctionSelector(func, funcSign),
+  PublicFunctionArg(func, funcArg, funcArgIndex),
+  RETURN(returnStmt, _, _),
+  Statement_Function(returnStmt, func),
+  StatementUsesMemory_ActualMemoryArg(returnStmt, _, funcRetIndex, funcRet),
+  DataFlows(funcArg, funcRet).
+
+// restore external call info
+.decl FLA_ExternalCallInfo(func:Function, callStmt:Statement, callOp:Opcode, calleeVar:Variable, numArg:number, numRet:number)
+.output FLA_ExternalCallInfo
+FLA_ExternalCallInfo(func, callStmt, callOp, calleeVar, numArg, numRet) :-
+  PublicFunctionSelector(func, _),
+  FLA_Statement_Function(callStmt, func),
+  (CALL(callStmt, _, calleeVar, _, _, _, _, _, _);STATICCALL(callStmt, _, calleeVar, _, _, _, _, _);DELEGATECALL(callStmt, _, calleeVar, _, _, _, _, _)),
+  Statement_Opcode(callStmt, callOp),
+  ExternalCall_NumOfArgs(callStmt, numArg),
+  numRet = count: ExternalCall_ActualReturn(callStmt, _, _).
+
+// restore funcSign
+.decl FLA_ExternalCall_FuncSign_ConstType(func:Function, callStmt:Statement, funcSign:Value)
+.output FLA_ExternalCall_FuncSign_ConstType
+FLA_ExternalCall_FuncSign_ConstType(func, callStmt, funcSign) :-
+  FLA_ExternalCallInfo(func, callStmt, _, _, _, _),
+  Variable_Value(actual, funcSign),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, 0, actual).
+
+.decl FLA_ExternalCall_FuncSign_ProxyType(func:Function, callStmt:Statement)
+.output FLA_ExternalCall_FuncSign_ProxyType
+FLA_ExternalCall_FuncSign_ProxyType(func, callStmt) :-
+  FLA_ExternalCallInfo(func, callStmt, _, _, _, _),
+  DELEGATECALL(callStmt, _, _, _, data_length, _, _, _),
+  CALLDATASIZE(_, data_length).
+
+FLA_ExternalCall_FuncSign_ProxyType(func, callStmt) :-
+  FLA_ExternalCallInfo(func, callStmt, _, _, _, _),
+  DELEGATECALL(callStmt, _, _, _, data_length2, _, _, _),
+  CALLDATASIZE(_, data_length1),
+  DataFlows(data_length1, data_length2).
+
+.decl FLA_ExternalCall_FuncSign_Metrics(func:Function, call:number, constType:number, proxyType:number)
+.output FLA_ExternalCall_FuncSign_Metrics
+FLA_ExternalCall_FuncSign_Metrics(func, callNum, constTypeNum, proxyTypeNum) :-
+  PublicFunctionSelector(func, _),
+  callNum = count:FLA_ExternalCallInfo(func, _, _, _, _, _),
+  constTypeNum = count:FLA_ExternalCall_FuncSign_ConstType(func, _, _),
+  proxyTypeNum = count:FLA_ExternalCall_FuncSign_ProxyType(func, _).
+
+// restore callee
+.decl FLA_ExternalCall_Callee_ConstType(func:Function, callStmt:Statement, callee:Value)
+.output FLA_ExternalCall_Callee_ConstType
+FLA_ExternalCall_Callee_ConstType(func, callStmt, callee) :-
+  FLA_ExternalCallInfo(func, callStmt, _, calleeVar, _, _),
+  Variable_Value(calleeVar, callee).
+
+.decl FLA_ExternalCall_Callee_StorageType(func:Function, callStmt:Statement, storageSlot:symbol, byteLow:number, byteHigh:number)
+.output FLA_ExternalCall_Callee_StorageType
+FLA_ExternalCall_Callee_StorageType(func, callStmt, storageSlot, byteLow, byteHigh) :-
+  FLA_ExternalCallInfo(func, callStmt, _, calleeVar, _, _),
+  !Variable_Value(calleeVar, _),
+  FLA_StorageVariableAddrType(storVar, calleeVar),
+  StorageVariableInfo(storVar, storageSlot, byteLow, byteHigh).
+
+.decl FLA_ExternalCall_Callee_StorageType_ForProxy(func:Function, callStmt:Statement, storageSlot:symbol)
+.output FLA_ExternalCall_Callee_StorageType_ForProxy
+FLA_ExternalCall_Callee_StorageType_ForProxy(func, callStmt, storageSlot) :-
+  FLA_ExternalCallInfo(func, callStmt, _, calleeVar, _, _),
+  DataFlows(var, calleeVar),
+  SLOADOfConst(_, storageSlot, var).
+
+.decl FLA_ExternalCall_Callee_FuncArgType(func:Function, callStmt:Statement, pubFun:Function, argIndex:number)
+.output FLA_ExternalCall_Callee_FuncArgType
+FLA_ExternalCall_Callee_FuncArgType(func, callStmt, pubFun, argIndex) :-
+  FLA_ExternalCallInfo(func, callStmt, _, calleeVar, _, _),
+  !Variable_Value(calleeVar, _),
+  PublicFunctionArg(pubFun, funcArg, argIndex),
+  DataFlows(funcArg, calleeVar).
+
+.decl FLA_ExternalCall_Callee_Metrics(pubFun:Function, callNum:number, typeConst:number, typeStorage:number, typeStorageForProxy:number, typeFuncArg:number)
+.output FLA_ExternalCall_Callee_Metrics
+FLA_ExternalCall_Callee_Metrics(pubFun, callNum, typeConst, typeStorage, typeStorageForProxy, typeFuncArg) :-
+  PublicFunctionSelector(pubFun, _),
+  callNum = count: FLA_ExternalCallInfo(pubFun, _, _, _, _, _),
+  typeConst = count: FLA_ExternalCall_Callee_ConstType(pubFun, _, _),
+  typeStorage = count: FLA_ExternalCall_Callee_StorageType(pubFun, _, _, _, _),
+  typeStorageForProxy = count: FLA_ExternalCall_Callee_StorageType_ForProxy(pubFun, _, _),
+  typeFuncArg = count: FLA_ExternalCall_Callee_FuncArgType(pubFun, _, _, _).
+
+.decl FLA_ExternalCall_Known_Arg(func:Function, callStmt:Statement, argIndex:number, argVal:Value)
+.output FLA_ExternalCall_Known_Arg
+FLA_ExternalCall_Known_Arg(func, callStmt, argIndex-1, argVal) :-
+  FLA_ExternalCallInfo(func, callStmt, _, _, _, _),
+  Variable_Value(arg, argVal),
+  StatementUsesMemory_ActualMemoryArg(callStmt, _, argIndex, arg),
+  argIndex != 0. 
+
+
+//
+.decl FLA_Statement_Function(stmt:Statement, func:Function)
+FLA_Statement_Function(stmt, func) :-
+  Statement_Function(stmt, func).
+
+FLA_Statement_Function(stmt, caller) :-
+  InFunction(block, caller),
+  CallGraphEdge(block, callee),
+  FLA_Statement_Function(stmt, callee).
+
+.decl FLA_FunctionInfo(func:Function, funcSign:symbol, funcHighLevelName:symbol)
+.output FLA_FunctionInfo
+FLA_FunctionInfo(func, funcSign, funcHighLevelName) :-
+  PublicFunctionSelector(func, funcSign),
+  HighLevelFunctionName(func, funcHighLevelName).
+
+.decl FLA_StorageVariableAddrType(storVar:symbol, calleeVar:Variable)
+FLA_StorageVariableAddrType(storVar, addr):-
+  StorageVariableInfo(storVar, originStorVar, byteLow, byteHigh),
+  VarHoldsBytesOfStorVarFinal(var, _, originStorVar, byteLow, byteHigh),
+  widthBytes = 1 + byteHigh - byteLow,
+  widthBytes = 20,
+  DataFlows(var, addr),
+  AddressTypedVar(addr).
+
+FLA_StorageVariableAddrType(storVar, addr):-
+  StorageVariableInfo(storVar, originStorVar, byteLow, byteHigh),
+  VarWrittenToBytesOfStorVarFinal(var, _, _, originStorVar, byteLow, byteHigh),
+  widthBytes = 1 + byteHigh - byteLow,
+  widthBytes = 20,
+  DataFlows(addr, var),
+  AddressTypedVar(addr).
+
+FLA_StorageVariableAddrType(storVar, addrFrom):-
+  AddressTypedVar(addrFrom),
+  DataFlows(addrFrom, addr),
+  (EQ(_, otherAddr, addr, _) ; EQ(_, addr, otherAddr, _)),
+  DataFlows(var, otherAddr),
+  VarHoldsBytesOfStorVarFinal(var, _, originStorVar, byteLow, byteHigh),
+  StorageVariableInfo(storVar, originStorVar, byteLow, byteHigh),
+  widthBytes = 1 + byteHigh - byteLow,
+  widthBytes = 20.
+
+.decl FLA_CompareVars(a: Variable, b: Variable, res: Variable)
+FLA_CompareVars(a, b, res) :-
+  LT(_, a, b, res);LT(_, b, a, res);
+  GT(_, a, b, res);LT(_, b, a, res);
+  SLT(_, a, b, res);LT(_, b, a, res);
+  SGT(_, a, b, res);LT(_, b, a, res).
+

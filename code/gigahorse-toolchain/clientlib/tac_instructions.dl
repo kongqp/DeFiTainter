@@ -1,0 +1,394 @@
+//
+// *** Three-address code INSTRUCTIONS ***
+// This is the schema for the input of any client analyses. Note the
+// (incompatible) overlap with names of instructions inside the
+// decompiler.  E.g., an ADD relation inside a decompiler is different
+// from the ADD relation established here.  We are changing
+// representation right after this phase: importing info that the
+// decompiler has produced and formatting it the way further analyses
+// want it.
+//
+
+// Macros
+#define MAKEBINOP(name) \
+.decl name(stmt: Statement, a: Variable, b: Variable, to: Variable)\
+name(stmt, a, b, to) :-\
+  Statement_Opcode(stmt, #name),\
+  Statement_Defines(stmt, to, _),\
+  Statement_Uses(stmt, a, 0),\
+  Statement_Uses(stmt, b, 1)
+
+#define MAKEBINARITHOP(name) \
+MAKEBINOP(name). \
+BinArith(#name)
+
+#define MAKEUNOP(name) \
+.decl name(stmt: Statement, a: Variable, to: Variable)\
+name(stmt, a, to) :-\
+  Statement_Opcode(stmt, #name),\
+  Statement_Defines(stmt, to, _),\
+  Statement_Uses(stmt, a, 0)
+
+#define MAKEUNARITHOP(name) \
+MAKEUNOP(name). \
+UnaryArith(#name)
+
+#define MAKEZEROOP(name) \
+.decl name(stmt: Statement, to: Variable)\
+name(stmt, to) :-\
+  Statement_Opcode(stmt, #name),\
+  Statement_Defines(stmt, to, _)
+
+
+// Place opcodes into various categories.
+.decl UnaryArith(opcode:Opcode)
+.decl BinArith(opcode:Opcode)
+.decl TernArith(opcode:Opcode)
+TernArith("ADDMOD").
+TernArith("MULMOD").
+
+
+// Binary operators
+MAKEBINOP(SHA3).
+
+// Binary arithmetic operators
+MAKEBINARITHOP(EQ).
+MAKEBINARITHOP(ADD).
+MAKEBINARITHOP(OR).
+MAKEBINARITHOP(SUB).
+MAKEBINARITHOP(AND).
+MAKEBINARITHOP(DIV).
+MAKEBINARITHOP(MUL).
+MAKEBINARITHOP(SDIV).
+MAKEBINARITHOP(MOD).
+MAKEBINARITHOP(SMOD).
+MAKEBINARITHOP(EXP).
+MAKEBINARITHOP(SIGNEXTEND).
+MAKEBINARITHOP(LT).
+MAKEBINARITHOP(GT).
+MAKEBINARITHOP(SLT).
+MAKEBINARITHOP(SGT).
+MAKEBINARITHOP(XOR).
+MAKEBINARITHOP(BYTE).
+MAKEBINARITHOP(SHL).
+MAKEBINARITHOP(SHR).
+MAKEBINARITHOP(SAR).
+
+// Unary operators
+MAKEUNOP(BLOCKHASH).
+MAKEUNOP(EXTCODEHASH).
+MAKEUNOP(EXTCODESIZE).
+MAKEUNOP(BALANCE).
+MAKEUNOP(CALLDATALOAD).
+MAKEUNOP(MLOAD).
+MAKEUNOP(SLOAD).
+
+MAKEUNARITHOP(ISZERO).
+MAKEUNARITHOP(NOT).
+
+// Zero argument operators
+MAKEZEROOP(GAS).
+MAKEZEROOP(CALLVALUE).
+MAKEZEROOP(CALLER).
+MAKEZEROOP(ORIGIN).
+MAKEZEROOP(ADDRESS).
+MAKEZEROOP(COINBASE).
+MAKEZEROOP(TIMESTAMP).
+MAKEZEROOP(DIFFICULTY).
+MAKEZEROOP(NUMBER).
+MAKEZEROOP(CALLDATASIZE).
+MAKEZEROOP(CODESIZE).
+
+
+.decl RuntimeKnowable(opcode:Opcode)
+RuntimeKnowable("ADDRESS").
+RuntimeKnowable("ORIGIN").
+RuntimeKnowable("CALLER").
+RuntimeKnowable("CALLVALUE").
+RuntimeKnowable("CALLDATASIZE").
+RuntimeKnowable("CODESIZE").
+RuntimeKnowable("GASPRICE").
+RuntimeKnowable("RETURNDATASIZE").
+RuntimeKnowable("COINBASE").
+RuntimeKnowable("BLOCKHASH").
+RuntimeKnowable("NUMBER").
+RuntimeKnowable("TIMESTAMP").
+
+.decl StatementStoresMemory(stmt: Statement)
+
+StatementStoresMemory(stmt) :-
+   Statement_Opcode(stmt, "MSTORE") ;
+   Statement_Opcode(stmt, "MSTORE8") ;
+   Statement_Opcode(stmt, "CALLDATACOPY") ;
+   Statement_Opcode(stmt, "CODECOPY") ;
+   Statement_Opcode(stmt, "EXTCODECOPY") ;
+   Statement_Opcode(stmt, "RETURNDATACOPY").
+//   Statement_Opcode(stmt, "CALL") ;
+//   Statement_Opcode(stmt, "CALLCODE") ;
+//   Statement_Opcode(stmt, "DELEGATECALL") ;
+//   Statement_Opcode(stmt, "STATICCALL").
+
+.decl StatementLoadsMemory(stmt: Statement)
+
+StatementLoadsMemory(stmt) :-
+   Statement_Opcode(stmt, "MLOAD").
+//   Statement_Opcode(stmt, "SHA3") ;
+//   Statement_Opcode(stmt, "CREATE") ;
+//   Statement_Opcode(stmt, "CREATE2") ;
+//   Statement_Opcode(stmt, "CALL") ;
+//   Statement_Opcode(stmt, "CALLCODE") ;
+//   Statement_Opcode(stmt, "DELEGATECALL") ;
+//   Statement_Opcode(stmt, "STATICCALL").
+
+.decl MSTORE(stmt: Statement, index: Variable, var: Variable)
+
+MSTORE(stmt, index, var) :-
+  Statement_Opcode(stmt,"MSTORE"),
+  Statement_Uses(stmt, index, 0),
+  Statement_Uses(stmt, var, 1).
+
+.decl MSTORE8(stmt: Statement, index: Variable, from: Variable)
+
+MSTORE8(stmt, index, from):-
+  Statement_Opcode(stmt, "MSTORE8"),
+  Statement_Uses(stmt, index, 0),
+  Statement_Uses(stmt, from, 1).
+
+.decl MSIZE(stmt: Statement, to: Variable)
+
+MSIZE(stmt, to):-
+  Statement_Opcode(stmt, "MSIZE"),
+  Statement_Defines(stmt, to, 0).
+
+.decl SSTORE(stmt: Statement, index: Variable, var: Variable)
+
+SSTORE(stmt, index, var) :-
+  Statement_Opcode(stmt,"SSTORE"),
+  Statement_Uses(stmt, index, 0),
+  Statement_Uses(stmt, var, 1).
+
+.decl CALL(stmt:Statement, gas:Variable, target:Variable, value:Variable, data_start:Variable,
+           data_length:Variable, return_start:Variable, return_length:Variable, success: Variable)
+
+
+CALL(stmt, gas, target, value, data_start, data_length, return_start, return_length, success) :-
+  Statement_Opcode(stmt, "CALL"),
+  Statement_Defines(stmt, success, _),
+  Statement_Uses(stmt, gas, 0),
+  Statement_Uses(stmt, target, 1),
+  Statement_Uses(stmt, value, 2),
+  Statement_Uses(stmt, data_start, 3),
+  Statement_Uses(stmt, data_length, 4),
+  Statement_Uses(stmt, return_start, 5),
+  Statement_Uses(stmt, return_length, 6).
+
+.decl STATICCALL(stmt:Statement, gas:Variable, target:Variable, data_start:Variable,
+           data_length:Variable, return_start:Variable, return_length:Variable, success: Variable)
+
+
+STATICCALL(stmt, gas, target, data_start, data_length, return_start, return_length, success) :-
+  Statement_Opcode(stmt, "STATICCALL"),
+  Statement_Defines(stmt, success, _),
+  Statement_Uses(stmt, gas, 0),
+  Statement_Uses(stmt, target, 1),
+  Statement_Uses(stmt, data_start, 2),
+  Statement_Uses(stmt, data_length, 3),
+  Statement_Uses(stmt, return_start, 4),
+  Statement_Uses(stmt, return_length, 5).
+
+
+
+.decl DELEGATECALL(stmt:Statement, gas:Variable, target:Variable, data_start:Variable,
+           data_length:Variable, return_start:Variable, return_length:Variable, success: Variable)
+
+
+DELEGATECALL(stmt, gas, target, data_start, data_length, return_start, return_length, success) :-
+  Statement_Opcode(stmt, "DELEGATECALL"),
+  Statement_Defines(stmt, success, _),
+  Statement_Uses(stmt, gas, 0),
+  Statement_Uses(stmt, target, 1),
+  Statement_Uses(stmt, data_start, 2),
+  Statement_Uses(stmt, data_length, 3),
+  Statement_Uses(stmt, return_start, 4),
+  Statement_Uses(stmt, return_length, 5).
+
+.decl CALLCODE(stmt:Statement, gas:Variable, target:Variable, data_start:Variable,
+           data_length:Variable, return_start:Variable, return_length:Variable, success: Variable)
+
+
+CALLCODE(stmt, gas, target, data_start, data_length, return_start, return_length, success) :-
+  Statement_Opcode(stmt, "CALLCODE"),
+  Statement_Defines(stmt, success, _),
+  Statement_Uses(stmt, gas, 0),
+  Statement_Uses(stmt, target, 1),
+  Statement_Uses(stmt, data_start, 2),
+  Statement_Uses(stmt, data_length, 3),
+  Statement_Uses(stmt, return_start, 4),
+  Statement_Uses(stmt, return_length, 5).
+
+.decl RETURNDATASIZE(s: Statement, f: Variable)
+RETURNDATASIZE(stmt, f) :-
+   Statement_Opcode(stmt, "RETURNDATASIZE"),
+   Statement_Defines(stmt, f, _).
+
+.decl RETURNDATACOPY(s: Statement, a: Variable, b: Variable, c: Variable)
+RETURNDATACOPY(stmt, a, b, c) :-
+   Statement_Opcode(stmt, "RETURNDATACOPY"),
+   Statement_Uses(stmt, a, 0),
+   Statement_Uses(stmt, b, 1),
+   Statement_Uses(stmt, c, 2).
+
+.decl CALLDATACOPY(s: Statement, mem_start: Variable, calldata_start: Variable, length: Variable)
+CALLDATACOPY(stmt, mem_start, calldata_start, length) :-
+   Statement_Opcode(stmt, "CALLDATACOPY"),
+   Statement_Uses(stmt, mem_start, 0),
+   Statement_Uses(stmt, calldata_start, 1),
+   Statement_Uses(stmt, length, 2).
+
+.decl EXTCODECOPY(s: Statement, target:Variable, mem_start: Variable, calldata_start: Variable, length: Variable)
+EXTCODECOPY(stmt, target, mem_start, extcode_start, length):-
+  Statement_Opcode(stmt, "EXTCODECOPY"),
+  Statement_Uses(stmt, target, 0),
+  Statement_Uses(stmt, mem_start, 1),
+  Statement_Uses(stmt, extcode_start, 2),
+  Statement_Uses(stmt, length, 3).
+
+.decl JUMP(stmt:Statement, dest:Variable)
+JUMP(stmt, dest) :-
+  Statement_Opcode(stmt, "JUMP"),
+  Statement_Uses(stmt, dest, 0).
+
+.decl JUMPI(stmt:Statement, dest:Variable, condVar:Variable)
+JUMPI(stmt, dest, condVar) :-
+  Statement_Opcode(stmt, "JUMPI"),
+  Statement_Uses(stmt, dest, 0),
+  Statement_Uses(stmt, condVar, 1).
+
+.decl THROW(stmt:Statement)
+THROW(stmt) :-
+  Statement_Opcode(stmt, "THROW").
+
+.decl REVERT(stmt:Statement, memStart:Variable, memLength:Variable)
+REVERT(stmt, memStart, memLength) :-
+  Statement_Opcode(stmt, "REVERT"),
+  Statement_Uses(stmt, memStart, 0),
+  Statement_Uses(stmt, memLength, 1).
+
+
+.decl SELFDESTRUCT(stmt:Statement, address:Variable)
+SELFDESTRUCT(stmt, address) :-
+  Statement_Opcode(stmt, "SELFDESTRUCT"),
+  Statement_Uses(stmt, address, 0).
+
+.decl STOP(stmt:Statement)
+STOP(stmt) :-
+  Statement_Opcode(stmt, "STOP").
+
+.decl RETURN(stmt:Statement, start: Variable, length: Variable)
+RETURN(stmt, start, length) :-
+  Statement_Opcode(stmt, "RETURN"),
+  Statement_Uses(stmt, start, 0),
+  Statement_Uses(stmt, length, 1).
+
+.decl FlowOp(op: Opcode)
+// Represents operations through which data can "flow"      
+FlowOp(op) :- BinArith(op).
+FlowOp(op) :- UnaryArith(op).
+FlowOp(op) :- TernArith(op).
+FlowOp("PHI").
+
+/**
+  Event logs
+  They need to be handled specially because they have 2 kinds of arguements
+  indexed, that are "normal" args and non indexed that are stored in memory
+  In solidity events, the 0th indexed argument is the topic (the hash of the signature)
+**/
+
+.decl LOGStatement(logStmt:Statement, nIndexedArgs:number)
+
+LOGStatement(stmt, 0):-
+  Statement_Opcode(stmt, "LOG0").
+
+LOGStatement(stmt, 1):-
+  Statement_Opcode(stmt, "LOG1").
+
+LOGStatement(stmt, 2):-
+  Statement_Opcode(stmt, "LOG2").
+
+LOGStatement(stmt, 3):-
+  Statement_Opcode(stmt, "LOG3").
+
+LOGStatement(stmt, 4):-
+  Statement_Opcode(stmt, "LOG4").
+
+
+/**
+  Indexed event arguments.
+  Keep in mind that the 0th indexed argument is usually the topic (the hash of the event signature)
+**/
+.decl LOGIndexedArg(logStmt: Statement, indexedArg: Variable, index: number)
+
+LOGIndexedArg(logStmt, indexedArg, index - 2):-
+  LOGStatement(logStmt, _),
+  Statement_Uses(logStmt, indexedArg, index),
+  index > 1.
+
+.decl CALLStatement(call:Statement, nOtherArgs:number)
+
+CALLStatement(call, 3):-
+  CALL(call, _, _, _, _, _, _, _, _).
+
+CALLStatement(call, 2):-
+  STATICCALL(call, _, _, _, _, _, _, _).
+
+CALLStatement(call, 2):-
+  DELEGATECALL(call, _, _, _, _, _, _, _).
+
+CALLStatement(call, 2):-
+  CALLCODE(call, _, _, _, _, _, _, _).
+
+
+// var is the result of a CALL operation, stmt
+.decl CallResult(var:Variable, stmt:Statement)
+
+CallResult(var, stmt) :- CALLStatement(stmt, _), Statement_Defines(stmt, var, _).
+
+.decl IsJump(s:Statement)
+IsJump(s) :- Statement_Opcode(s, "JUMP").
+IsJump(s) :- Statement_Opcode(s, "JUMPI").
+
+
+// Instructions introduced by the new decompiler
+.decl PHI(s: Statement, fro: Variable, to: Variable)
+
+PHI(stmt, fro, to) :-
+   Statement_Opcode(stmt, "PHI"),
+   Statement_Defines(stmt, to, _),
+   Statement_Uses(stmt, fro, _).
+
+.decl CALLPRIVATE(s: Statement, f: Variable)
+
+CALLPRIVATE(stmt, f) :-
+   Statement_Opcode(stmt, "CALLPRIVATE"),
+   Statement_Uses(stmt, f, 0).
+
+
+.decl RETURNPRIVATE(s: Statement, b: Variable)
+RETURNPRIVATE(stmt, b) :-
+   Statement_Opcode(stmt, "RETURNPRIVATE"),
+   Statement_Uses(stmt, b, 0).
+
+.decl PrecompiledCall(stmt: Statement)
+
+PrecompiledCall(stmt) :-
+   (STATICCALL(stmt, _, addr, _, _, _, _, _) ;
+   CALL(stmt, _, addr, _, _, _, _, _, _)),
+   (Variable_Value(addr, "0x0") ; Variable_Value(addr, "0x1") ; Variable_Value(addr, "0x2") ;
+    Variable_Value(addr, "0x3") ; Variable_Value(addr, "0x4") ; Variable_Value(addr, "0x5") ;
+    Variable_Value(addr, "0x6") ; Variable_Value(addr, "0x7")).
+
+
+.decl CONST(stmt: Statement, var: Variable)
+
+CONST(stmt, var) :-
+   Statement_Opcode(stmt, "CONST"), Statement_Defines(stmt, var, _).

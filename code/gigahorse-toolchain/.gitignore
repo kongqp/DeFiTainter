@@ -1,0 +1,61 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+.ipynb_checkpoints
+
+# C extensions
+*.so
+
+# Documentation build dir
+doc/build/
+
+# Documentation auto-generated sources
+doc/source/modules
+
+# Cache dir used by pytest
+.cache/
+
+# Cache dir used for souffle executables
+cache/
+
+# Output files from decompiler
+*.facts
+
+# NodeJS temp files
+.node-xmlhttprequest*
+
+# Scraper output
+0x*_creation.hex
+0x*_runtime.hex
+0x*.json
+
+# Node modules
+node_modules/
+
+# Vim swapfiles
+*.swp
+
+# IDEs
+.idea
+
+# script-generated bats test files
+*.generated.bats
+*.csv
+
+.temp
+
+# decompilation results
+results.json
+
+# souffle compilation files
+*_compiled
+*_compiled
+*.ccerr
+*.cpp
+
+# testing files
+.tests/**
+
+# sqlite databases
+*.sqlite

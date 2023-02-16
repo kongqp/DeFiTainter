@@ -1,0 +1,1091 @@
+#define FRESH_VARIABLE(var, stmt, stackIndex) (IRStatementNum((stmt), ?stmtNum), var=-0xFFFF+?stmtNum*MAX_STACK_HEIGHT+(stackIndex))
+
+//#define DEBUG
+
+#define RETURN_ADDRESS_RANK_THRESHOLD 25
+#define LIMITSIZE_CAN_REACH_UNDER_CONTEXT 25000000
+
+/*****
+ * Function discovery logic
+ *****/
+
+
+/******
+         Generic basic block Reachable-from implementation
+******/
+
+// Created because its faster to iterate it than to iterate BlockEdge
+// when we only care about contexts
+.decl ContextEdge(ctxFrom:global.sens.Context, ctxTo:global.sens.Context)
+ContextEdge(ctxFrom, ctxTo):-
+  global.BlockEdge(ctxFrom, _, ctxTo, _).
+
+.decl ContextCanReach(fromCtx: global.sens.Context, ctx: global.sens.Context)
+#ifdef ENABLE_LIMITSIZE
+.limitsize ContextCanReach(n=LIMITSIZE_CAN_REACH_UNDER_CONTEXT)
+#endif
+
+ContextCanReach(ctx, ctx) :-
+  global.ReachableContext(ctx, _).
+
+ContextCanReach(ctxFrom, ctxTo) :-
+  ContextCanReach(ctxFrom, ctxOther),
+  ContextEdge(ctxOther, ctxTo).
+
+
+
+/******
+         Heuristics for detecting call-return patterns
+******/
+
+/**
+  A high-level call can only be translated into an immediate jump.
+  More complex jumps (e.g., through basic blocks that just keep
+  whatever was on the stack and jump to it) are technicalities for inlining.
+*/
+.decl PotentialCall(caller:Block)
+PotentialCall(block) :-
+  postTrans.ImmediateBlockJumpTarget(block, _).
+
+.decl OptNotImmediateBlockJumpTarget(retCtx:global.sens.Context, ret:Block, targetVariable:Variable, retTarget:Block)
+OptNotImmediateBlockJumpTarget(retCtx, retBlock, targetVariable, retTarget) :-
+  global.BlockJumpValidTarget(retCtx, retBlock, targetVariable, retTarget),
+  !postTrans.ImmediateBlockJumpTarget(retBlock, targetVariable).
+
+
+
+/**
+  Call-return pattern:
+  a) basic block jumps to a valid "non-locally-derived" address
+  b) address originates at a target-setter.
+  Since there may be multiple return addresses pushed together (one for the first
+  call, one for another call after that, etc.) we want to rank them and match
+  them in order.
+  Keeps the context of the return jump
+*/
+.decl PossibleReturnAddressWithPos(targetSetter:Block, retCtx:global.sens.Context, retBlock:Block, retTarget:Block, pos:number)
+PossibleReturnAddressWithPos(targetSetter, retCtx, retBlock, retTarget, pos) :-
+  OptNotImmediateBlockJumpTarget(retCtx, retBlock, targetVariable, retTarget),
+  postTrans.Statement_Defines(targetSetStatement, targetVariable),
+  postTrans.Statement_Block(targetSetStatement, targetSetter),
+  postTrans.BasicBlock_Tail(targetSetter, jumpStmt),
+  postTrans.JUMP(jumpStmt),
+  postTrans.BeforeLocalStackContents(jumpStmt, pos, targetVariable).
+
+.decl PossibleReturnAddressWithLowerPos(targetSetter:Block, retBlock:Block, retTarget:Block, pos:number, otherPos:number)
+PossibleReturnAddressWithLowerPos(targetSetter, retBlock, retTarget, pos, otherPos) :-
+  PossibleReturnAddressWithPos(targetSetter, _, retBlock, retTarget, pos),
+  PossibleReturnAddressWithPos(targetSetter, _, _, _, otherPos),
+  otherPos < pos.
+
+.decl InitialPossibleReturnAddressWithRank(targetSetter:Block, retCtx:global.sens.Context, retBlock:Block, retTarget:Block, rank:number)
+InitialPossibleReturnAddressWithRank(targetSetter, retCtx, retBlock, retTarget, rank) :-
+  PossibleReturnAddressWithPos(targetSetter, retCtx, retBlock, retTarget, pos),
+  rank = count : PossibleReturnAddressWithLowerPos(targetSetter, retBlock, retTarget, pos, _).
+
+.decl OptBlockJumpContext(callCtx:global.sens.Context, targetSetter:Block)
+OptBlockJumpContext(callCtx, targetSetter) :-
+  global.BlockJumpValidTarget(callCtx, targetSetter, _, _). // REVIEW: maybe bad?
+
+.decl PossibleReturnAddressWithRank(callCtx:global.sens.Context, targetSetter:Block, retCtx:global.sens.Context, retBlock:Block, retTarget:Block, rank:number)
+PossibleReturnAddressWithRank(callCtx, targetSetter, retCtx, retBlock, retTarget, rank) :-
+  InitialPossibleReturnAddressWithRank(targetSetter, retCtx, retBlock, retTarget, rank),
+  OptBlockJumpContext(callCtx, targetSetter).
+
+.decl MaxRankForPossibleReturnAddressSetter(targetSetter:Block, rank:number)
+MaxRankForPossibleReturnAddressSetter(targetSetter, rank) :-
+  InitialPossibleReturnAddressWithRank(targetSetter, _, retBlock, retTarget, rank),
+  PossibleReturnAddressWithPos(targetSetter, _, retBlock, retTarget, pos),
+  !PossibleReturnAddressWithLowerPos(targetSetter, _, _, _, pos).
+
+
+// If we find a direct jump (to a purported function) and the first
+// pushed return address (jumped-to by code reachable from the
+// purported function) before it, we detect a call-return pattern.
+  
+
+
+/**
+  Also match a subset of those with return addresses and full info. The
+  function may not be the one containing the return, in case of complex
+  call patterns (e.g., call-call, or call-return).
+  ctx is the context of the function call jump
+  retCtx is the context of the return jump
+  The basic reason for this is that something can be a call or return jump
+  under some context and not under others
+  Retaining ctx information at this level makes MaybeInFunctionUnderContext very precise
+  This in turn allows us to go from BlockEdges to IRBlockEdges with increased precision
+*/
+.decl MaybeFunctionCallReturn(ctx:global.sens.Context, caller:Block, func:Block, retCtx:global.sens.Context, retBlock:Block, retTarget:Block)
+MaybeFunctionCallReturn(ctx, caller, func, retCtx, retBlock, retTarget) :-
+  PossibleReturnAddressWithRank(ctx, caller, retCtx, retBlock, retTarget, 0),
+  postTrans.ImmediateBlockJumpTarget(caller, targetVar),
+  postTrans.Statement_Block(jump, caller),
+  postTrans.Statement_Opcode(jump, "JUMP"), //Added to invalidate JUMPIs we will need to deal with them though
+  global.BlockJumpValidTarget(ctx, caller, targetVar, func),
+  ContextCanReach(ctx, retCtx),
+  global.BlockJumpValidTarget(retCtx, retBlock, _, retTarget).
+
+/**
+  Introduced to use in many rules that don't use the context of the context-sensitive version
+  Should be used when possible because the latter can get very heavy
+*/
+.decl MaybeFunctionCallReturn_Ins(caller:Block, func:Block, retBlock:Block, retTarget:Block)
+MaybeFunctionCallReturn_Ins(caller, func, retBlock, retTarget):-
+  MaybeFunctionCallReturn(_, caller, func, _, retBlock, retTarget).
+
+
+// Auxiliary, for optimization
+.decl PossibleReturnAddressWithPositiveRank(callCtx:global.sens.Context, targetSetter:Block, retCtx:global.sens.Context, retBlock:Block, retTarget:Block, rank:number)
+PossibleReturnAddressWithPositiveRank(callCtx, caller, retCtx, retBlock, retTarget, n) :-
+  PossibleReturnAddressWithRank(callCtx, caller, retCtx, retBlock, retTarget, n),
+  ContextCanReach(callCtx, retCtx),
+  global.BlockJumpValidTarget(retCtx, retBlock, _, retTarget),
+  n > 0,
+  n < RETURN_ADDRESS_RANK_THRESHOLD.
+
+.decl MaybeFunctionCallReturnNewContext(ctx:global.sens.Context, caller:Block, retTargetCtx:global.sens.Context, retTarget:Block)
+MaybeFunctionCallReturnNewContext(ctx, caller, retTargetCtx, retTarget) :-
+  MaybeFunctionCallReturn(ctx, caller, _, retCtx, ret, retTarget),
+  global.BlockEdge(retCtx, ret, retTargetCtx, retTarget).
+
+/**
+  If we have found a likely call-return pattern, we propagate to the return
+  block the extra pushed return values of the former caller. Stacking return
+  values is a usual pattern in produced code.
+*/
+.decl OptBlockImmediateJump(callCtx:global.sens.Context, caller:Block)
+OptBlockImmediateJump(newCallCtx, caller) :-
+  global.BlockJumpValidTarget(newCallCtx, caller, targetVar, _),
+  postTrans.ImmediateBlockJumpTarget(caller, targetVar).
+
+// Case where the caller pushes new return targets as well.
+PossibleReturnAddressWithRank(newCallCtx, caller, retCtx, retBlock, retTarget, n + maxrank) :-
+  PossibleReturnAddressWithPositiveRank(prevCallCtx, targetSetter, retCtx, retBlock, retTarget, n),
+  MaybeFunctionCallReturnNewContext(prevCallCtx, targetSetter, newCallCtx, caller),
+  OptBlockImmediateJump(newCallCtx, caller),
+  MaxRankForPossibleReturnAddressSetter(caller, maxrank),
+  n + maxrank < RETURN_ADDRESS_RANK_THRESHOLD.
+ .plan 1:(2,3,1,4)
+
+// Case where the caller doesn't push new return targets to the stack
+PossibleReturnAddressWithRank(newCallCtx, caller, retCtx, retBlock, retTarget, n-1) :-
+  PossibleReturnAddressWithPositiveRank(prevCallCtx, targetSetter, retCtx, retBlock, retTarget, n),
+  MaybeFunctionCallReturnNewContext(prevCallCtx, targetSetter, newCallCtx, caller),
+  OptBlockImmediateJump(newCallCtx, caller),
+  !PossibleReturnAddressWithPos(caller, _, _, _, _).
+ .plan 1:(2,3,1)
+
+/**
+  Seems pretty certain we found a return. In fact, at this point,
+  with the above logic, we have detected all original return
+  instructions in the code. There will be artificial returns added
+  later, for calls that end up being tail calls.
+  It's important to note that a statement may be a return with respect
+  to one edge, but not with respect to others. There are many conditional returns.
+*/
+.decl IsReturn(retCtx:global.sens.Context, ret:Block, target:Block)
+IsReturn(retCtx, retBlock, retTarget) :-
+  IsFunctionCallReturn(_, _, _, retCtx, retBlock, retTarget).
+
+/**
+  In this case the complete vs. precise version doesn't seem to be
+  making much of a difference.
+*/
+.decl MaybeReturn(ret:Block, target:Block)
+MaybeReturn(retBlock, retTarget) :-
+  PossibleReturnAddressWithPos(_, _, retBlock, retTarget, _).
+// PossibleReturnAddress(_, retBlock, retTarget).
+
+/**
+  Filtering for sanitization. The logic following can be arbitrarily
+  restrictive. We have all potential calls and all returns, now we
+  want to match them to each other and form cohesive functions (both
+  for the caller and for the callee) only with very high certainty.
+*/
+.decl FunctionCalledMultipleTimes(func: Block)
+FunctionCalledMultipleTimes(func) :-
+  MaybeFunctionCallReturn_Ins(caller, func, retBlock, _),
+  MaybeFunctionCallReturn_Ins(caller2, func, retBlock, _),
+  caller != caller2.
+
+.decl FunctionSharesReturnBlock(func:Block)
+FunctionSharesReturnBlock(func) :-
+  MaybeFunctionCallReturn_Ins(_, func, retBlock, _),
+  MaybeFunctionCallReturn_Ins(_, func2, retBlock, _),
+  func != func2.
+
+.decl FunctionReturnIsStackBalanceBlock(func:Block)
+FunctionReturnIsStackBalanceBlock(func) :-
+  MaybeFunctionCallReturn_Ins(_, func, retBlock, _),
+  postTrans.StackBalanceBlock(retBlock).
+
+/**
+  If a block is a possible return of more than one functions, clone it in both
+  Previous code had an invariant where a "return block can only pertain to one function!"
+  which was problematic in many cases and could end up cloning blocks but not mark them as return blocks
+*/
+BlockToClone(retBlock, func):-
+  MaybeFunctionCallReturn_Ins(_, func, retBlock, _),
+  MaybeFunctionCallReturn_Ins(_, func2, retBlock, _),
+  func != func2,
+  func !=retBlock,
+  func2 !=retBlock.
+
+// Block reached from return edge cannot also be called directly
+.decl NotValidReturnEdge(retBlock: Block, retTarget: Block)
+NotValidReturnEdge(retBlock, retTarget) :-
+  MaybeFunctionCallReturn_Ins(_, _, retBlock, retTarget),
+  MaybeFunctionCallReturn_Ins(_, retTarget, _, _).
+
+// Caller calls func and func returns to retTarget. Should only be inferred with
+// high confidence.
+.decl IsFunctionCallReturn(ctx:global.sens.Context, caller:Block, func:Block, retCtx:global.sens.Context, retBlock:Block, retTarget:Block)
+IsFunctionCallReturn(ctx, caller, func, retCtx, retBlock, retTarget) :-
+  MaybeFunctionCallReturn(ctx, caller, func, retCtx, retBlock, retTarget),
+  //FunctionCalledMultipleTimes(func),
+  (FunctionCalledMultipleTimes(func) ; FunctionSharesReturnBlock(func) ; FunctionReturnIsStackBalanceBlock(func)),
+  !NotValidReturnEdge(retBlock, retTarget).
+
+
+// SL: Basic filtering to remove some trash introduced in rare cases by the basic logic in local.dl
+.decl PublicFunctionFiltered(block: Block, sigHash: Value)
+
+PublicFunctionFiltered(func, sigHash):-
+   postTrans.PublicFunctionJump(prev, sigHash),
+   postTrans.PublicFunction(func, sigHash),
+   global.BlockEdge(_, prev, _, func).
+
+// NOTE the philosophy!  MaybeFunctionCallReturn intends to be
+// complete, IsFunctionCallReturn intends to be precise.  Be careful when
+// using the one vs. the other! Their balance is crucial.
+
+/// Let's try something dead simple for assigning blocks to functions.
+
+.decl IsFunctionEntry(entry:Block)
+IsFunctionEntry(block) :- PublicFunctionFiltered(block, _).
+IsFunctionEntry("0x0").
+IsFunctionEntry(func) :- IsFunctionCallReturn(_, _, func, _, _, _).
+
+.decl IsFunctionCall(block:Block, func:Block)
+
+.decl IsPrivateFunctionCall(ctx:global.sens.Context, block:Block, func:Block)
+.decl IsPublicFunctionCall(block:Block, func:Block)
+
+IsFunctionCall(prev, func),
+IsPublicFunctionCall(prev, func) :-
+   postTrans.PublicFunctionJump(prev, sigHash),
+   PublicFunctionFiltered(func, sigHash),
+   global.BlockEdge(_, prev, _, func).
+
+
+IsFunctionCall(block, func) :-
+  IsPrivateFunctionCall(_, block, func).
+
+// Use the precise version here!
+IsPrivateFunctionCall(ctx, block, func) :-
+  IsFunctionCallReturn(ctx, block, func, _, _, _).
+
+// Precise context-sensitive reasoning
+.decl MaybeInFunctionUnderContext(ctx: global.sens.Context, block:Block, func:Block)
+
+MaybeInFunctionUnderContext(ctx, func, func) :-
+  (IsPublicFunctionCall(_, func) ; func = "0x0"),
+  global.ReachableContext(ctx, func).
+
+MaybeInFunctionUnderContext(ctx, func, func) :-
+  IsPrivateFunctionCall(prevCtx, block, func), //REVIEW: Could use MaybeFunctionCallReturn?
+  global.BlockEdge(prevCtx, block, ctx, func).
+
+MaybeInFunctionUnderContext(ctx, next, func) :-
+  MaybeInFunctionUnderContext(prevCtx, block, func),
+  global.BlockEdge(prevCtx, block, ctx, next),
+  // Not binding 'block' to cover case where fallback is reached from more than one prev blocks
+  !IsPublicFunctionCall(_, next),
+  !IsPrivateFunctionCall(prevCtx, block, next),
+  !IsReturn(prevCtx, block, next).
+
+MaybeInFunctionUnderContext(ctx, next, func) :-
+  OptMaybeInFunctionUnderContext(callerCtx, caller, func),
+  // Use the complete version here!
+  IsFunctionCallReturn(callerCtx, caller, _, retCtx, retBlock, next), //REVIEW use maybefunccall?
+  global.BlockEdge(retCtx, retBlock, ctx, next).
+
+
+.decl OptMaybeInFunctionUnderContext(callerCtx: global.sens.Context, caller:Block, func:Block)
+OptMaybeInFunctionUnderContext(callerCtx, caller, func) :-
+  MaybeInFunctionUnderContext(callerCtx, caller, func),
+  MaybeFunctionCallReturn(callerCtx, caller, _, _, _, _). // TODO: Make this consistent.
+
+
+.decl MaybeInFunction(block:Block, func:Block)
+MaybeInFunction(block, func) :-
+  MaybeInFunctionUnderContext(_, block, func).
+
+.decl BlockInMultipleFunctions(entry: Block)
+BlockInMultipleFunctions(block) :-
+  MaybeInFunction(block, func1),
+  MaybeInFunction(block, func2),
+  func1 != func2.
+
+
+// For this function, the block should be inlined.
+.decl BlockToClone(block: Block, func: Block)
+BlockToClone(next, func) :-
+  MaybeInFunction(next, func),
+  BlockInMultipleFunctions(next),
+  next != func. // don't clone function entries, other functions will clone them
+
+/* The following stack balancing code is dead code */
+
+.decl StackBalancingBlockPrevNextInFunction(ctx:global.sens.Context, block:Block, func:Block, prev:Block, next:Block)
+.decl StackBalancingBlockJumpSequence(ctx:global.sens.Context, block:Block, func:Block, prev:Block, next:Block, seq:symbol)
+.decl StackBalancingBlockJumpImprecision(block:Block, func:Block)
+
+
+StackBalancingBlockPrevNextInFunction(ctx, block, func, prev, next):-
+  postTrans.StackBalanceBlock(block),
+  MaybeInFunction(block, func),
+  global.BlockEdge(_, prev, ctx, block),
+  MaybeInFunction(prev, func),
+  global.BlockEdge(ctx, block, _, next),
+  MaybeInFunction(next, func),
+  !IsFunctionCallReturn(_, _, func, _, block, _). // REVIEW if to make useful
+
+StackBalancingBlockJumpSequence(ctx, block, func, prev, next, cat(block, mid)):-
+  StackBalancingBlockPrevNextInFunction(ctx, block, func, prev, mid),
+  global.BlockEdge(ctx, block, nextCtx, mid),
+  StackBalancingBlockPrevNextInFunction(nextCtx, mid, func, block, next),
+  !postTrans.StackBalanceBlock(next).
+
+StackBalancingBlockJumpSequence(ctx, block, func, prev, next, cat(block, cat(mid1, mid2))):-
+  StackBalancingBlockPrevNextInFunction(ctx, block, func, prev, mid1),
+  global.BlockEdge(ctx, block, midCtx1, mid1),
+  StackBalancingBlockPrevNextInFunction(midCtx1, mid1, func, block, mid2),
+  global.BlockEdge(midCtx1, mid1, midCtx2, mid2),
+  StackBalancingBlockPrevNextInFunction(midCtx2, mid2, func, mid1, next),
+  !postTrans.StackBalanceBlock(next).
+
+StackBalancingBlockJumpImprecision(block, func):-
+  StackBalancingBlockPrevNextInFunction(_, block, func, prev1, next1),
+  StackBalancingBlockPrevNextInFunction(_, block, func, prev2, next2),
+  next1 != next2,
+  prev1 != prev2.
+
+
+/***********
+ * Introduce new IR
+ ***********/
+#define FRESH_IRBLOCK(b, f) cat((b), (f))
+#define FRESH_IRSTATEMENT(s, f) cat((s), (f))
+#define BLOCK_TO_IRBLOCK(b) as(b, IRBlock)
+#define STATEMENT_TO_IRSTATEMENT(s) as(s, IRStatement)
+#define FUNCTION_TO_IRFUNCTION(f) as(f, IRBlock)
+ 
+.type IRBlock <: symbol
+// exploit type checking in new IR
+#define IRFunction IRBlock
+.type IRStatement <: symbol
+
+.decl Block_IRBlock(block: Block, func: Block, irblock: IRBlock)
+.decl Function_IRFunction(func: Block, irFunc: IRFunction)
+.decl IRInFunction(block: IRBlock, func: IRFunction)
+.decl IRFunctionEntry(irEntry: IRBlock)
+
+// Let's first settle what belongs in which function,
+// i.e., the nodes of our graph. Clone blocks as needed.
+
+Function_IRFunction(funcentry, irEntry),
+IRFunctionEntry(irEntry) :-
+  IsFunctionEntry(funcentry),
+  irEntry = FUNCTION_TO_IRFUNCTION(funcentry).
+
+// Be loose in our demands for accepting a block as being in the same
+// function.
+Block_IRBlock(block, func, irblock),
+IRInFunction(irblock, irFunc) :-
+  MaybeInFunction(block, func),
+  !BlockToClone(block, func),
+  irblock = BLOCK_TO_IRBLOCK(block),
+  Function_IRFunction(func, irFunc).
+
+Block_IRBlock(block, func, irblock),
+IRInFunction(irblock, irFunc) :-
+  MaybeInFunction(block, func),
+  BlockToClone(block, func),
+  irblock = FRESH_IRBLOCK(block, func),
+  Function_IRFunction(func, irFunc).
+
+// Now let's settle the edges of the graph: which
+// block is connected to which next one.
+
+
+/**
+  Contains the (callee-side) return block `ret` of __private__ function `fn`
+*/
+.decl IRFunction_Return(fn: IRFunction, ret: IRBlock)
+
+/**
+  Block `caller` makes a call to __private__ function `func`, with control-flow resuming to
+  the caller-side block `retcaller`.
+*/
+.decl IRFunctionCallReturn(caller: IRBlock, func: IRFunction, retcaller: IRBlock)
+
+// Be strict in our precision demands for recognizing a call
+IRFunction_Return(irfunc, retir),
+IRFunctionCallReturn(callerir, irfunc, callerretir):-
+  IsFunctionCallReturn(ctx, caller, func, _, ret, callerret), //REVIEW: take advantage of retCtx
+  MaybeInFunctionUnderContext(ctx, caller, prevfunc),
+  Block_IRBlock(ret, func, retir),
+  Block_IRBlock(caller, prevfunc, callerir),
+  Block_IRBlock(callerret, prevfunc, callerretir),
+  Function_IRFunction(func, irfunc).
+  //!BlockToClone(func, prevfunc).
+
+
+/**
+  `IRFunctionCall` includes the results of `IRFunctionCallReturn` (__private__ function calls).  
+  In addition it includes the "calls" to the contract's own __public__ functions inside the function selector.
+*/
+.decl IRFunctionCall(from: IRBlock, func: IRFunction)
+
+IRFunctionCall(callerir, irfunc) :-
+  IRFunctionCallReturn(callerir, irfunc, _).
+
+IRFunctionCall(fromir, irfunc) :-
+  IsPublicFunctionCall(from, func),
+  Block_IRBlock(from, _ /* prevfunc */, fromir),
+  Function_IRFunction(func, irfunc).
+//  !BlockToClone(func, prevfunc).
+
+
+
+// ///// This doesn't seem to be valid
+// // Regular return instructions should also count as IR returns? For
+// // use in possible #return values calculation.
+// IRFunction_Return(irFunc, retBlock) :-
+//   Statement_Opcode(stmt, "RETURN"),
+//   Statement_IRStatement(stmt, func, irstmt),
+//   IRBasicBlock_Tail(retBlock, irstmt),
+//   Function_IRFunction(func, irFunc).
+
+/**
+  Taking advantage of the public function context(for contexts that include it)
+  in order to get more precise IRBlockEdges for public functions
+  When no public function context exists or the IRBlockEdge is not part of a public function 
+  the old logic is activated
+*/
+.decl PubFun(entry:symbol, hex:symbol)
+
+PubFun("0x0", FALLBACK_FUNCTION_SIGHASH):- global.sens.Context_PublicFunction(_, _).
+PubFun(entry, sigHash):- global.sens.Context_PublicFunction(_, sigHash), PublicFunctionFiltered(entry, sigHash).
+
+// Intra-function edges (i.e., real CFG edges)
+
+/**
+  WARNING: Be careful when using! This is an unintuitive
+  concept. It's only mapping the intra-procedural subset of
+  BlockEdges to the functional IR, not all BlockEdges. It's also
+  not the same as the "local" block edges of the functional IR,
+  because these also continue the function code after a call.
+*/
+.decl IRBlockEdge(from: IRBlock, to: IRBlock)
+
+IRBlockEdge(irfrom, irto) :-
+  global.BlockEdge(ctxFrom, from, ctxTo, to),
+  Block_IRBlock(from, func, irfrom),
+  MaybeInFunctionUnderContext(ctxFrom, from, func),
+  MaybeInFunctionUnderContext(ctxTo, to, func),
+  PubFun(func, pubFun),
+  global.sens.Context_PublicFunction(ctxTo, pubFun),
+  // The following negation makes our code incomplete in cases where the return block
+  // can be shared by callee and caller, but keeps our produced IR precise.
+  // Removing it results in inconsistent IR (return blocks with local edges from them)
+  // and less precise, but also more complete output.
+  !IsFunctionCallReturn(_, _, func, _, from, _), // REVIEW: Keeping this for now. We need to fix it.
+  !IsFunctionCallReturn(_, _, _, ctxFrom, from, to),
+  !IsFunctionCallReturn(ctxFrom, from, to, _, _, _),
+  Block_IRBlock(to, func, irto).
+
+IRBlockEdge(irfrom, irto) :-
+  global.BlockEdge(ctxFrom, from, ctxTo, to),
+  Block_IRBlock(from, func, irfrom),
+  MaybeInFunctionUnderContext(ctxFrom, from, func),
+  MaybeInFunctionUnderContext(ctxTo, to, func),
+  !PubFun(func, _),
+  // The following negation makes our code incomplete in cases where the return block
+  // can be shared by callee and caller, but keeps our produced IR precise.
+  // Removing it results in inconsistent IR (return blocks with local edges from them)
+  // and less precise, but also more complete output.
+  !IsFunctionCallReturn(_, _, func, _, from, _), // REVIEW: Keeping this for now. We need to fix it.
+  !IsFunctionCallReturn(_, _, _, ctxFrom, from, to),
+  !IsFunctionCallReturn(ctxFrom, from, to, _, _, _),
+  Block_IRBlock(to, func, irto).
+
+.decl IRBlockPath(from: IRBlock, to: IRBlock)
+
+IRBlockPath(irblk, irblk):-
+  Block_IRBlock(_, _, irblk).
+
+IRBlockPath(from, next):-
+  IRBlockPath(from, to),
+  (IRFunctionCallReturn(to, _, next) ;   IRBlockEdge(to, next)).
+
+.decl ReachableFromFunHead(irblk:IRBlock)
+
+ReachableFromFunHead(irblk):-
+  Block_IRBlock(_, func, irblk),
+  Block_IRBlock(func, func, irfunHead),
+  IRBlockPath(irfunHead, irblk).
+
+.decl InvalidIRBlockEdge(from: IRBlock, to: IRBlock)
+
+InvalidIRBlockEdge(irfrom, irto):-
+  IRBlockEdge(irfrom, irto),
+  !ReachableFromFunHead(irto).
+
+InvalidIRBlockEdge(irfrom, irto):-
+  IRBlockEdge(irfrom, irto),
+  !ReachableFromFunHead(irfrom).
+
+
+.decl LocalBlockEdge(block: IRBlock, next: IRBlock)
+LocalBlockEdge(irfrom, irto) :-
+  IRBlockEdge(irfrom, irto),
+  !InvalidIRBlockEdge(irfrom, irto).
+LocalBlockEdge(block, next) :-
+  IRFunctionCallReturn(block, _, next),
+  ReachableFromFunHead(block).
+
+.decl DeadBlock(irblk:IRBlock)
+.decl DeadStmt(irstmt:IRStatement)
+
+DeadBlock(irblk):-
+  //(InvalidIRBlockEdge(irblk, _);InvalidIRBlockEdge(_, irblk)),
+  Block_IRBlock(_, _, irblk),
+  !ReachableFromFunHead(irblk).
+
+DeadStmt(irstmt):-
+  IRStatement_Block(irstmt, irblk),
+  DeadBlock(irblk).
+
+//
+// The next few are mostly direct translations of concepts from the
+// standard TAC IR to the Functional IR.
+//
+
+.decl IRFallthroughEdge(from: IRBlock, to: IRBlock)
+IRFallthroughEdge(irfrom, irto) :-
+  global.FallthroughEdge(from, to),
+  Block_IRBlock(from, func, irfrom),
+  Block_IRBlock(to, func, irto).
+
+
+.decl Statement_IRStatement(stmt: Statement, func: Block, irstmt: IRStatement)
+.decl IRStatement_Block(stmt: IRStatement, to: IRBlock)
+
+.decl IRStatement_VarString(irstmt: IRStatement, func: symbol)
+.decl IRBlock_VarString(irblock: IRBlock, str: symbol)
+IRStatement_VarString(irstmt, irFunc),
+IRBlock_VarString(irblock, irFunc),
+IRStatement_Block(irstmt, irblock),
+Statement_IRStatement(stmt, func, irstmt) :-
+  BlockToClone(block, func),
+  postTrans.Statement_Block(stmt, block),
+  Block_IRBlock(block, func, irblock),
+  Function_IRFunction(func, irFunc),
+  irstmt = FRESH_IRSTATEMENT(stmt, func).
+
+IRStatement_VarString(irstmt, ""),
+IRBlock_VarString(irblock, ""),
+IRStatement_Block(irstmt, irblock),
+Statement_IRStatement(stmt, func, irstmt) :-
+  Block_IRBlock(block, func, irblock),
+  !BlockToClone(block, func),
+  postTrans.Statement_Block(stmt, block),
+  irstmt = STATEMENT_TO_IRSTATEMENT(stmt).
+
+.decl IRStatementNum(stmt: IRStatement, num: number)
+IRStatementNum(irstmt, num) :-
+  postTrans._StatementNum(stmt, num),
+  Statement_IRStatement(stmt, _, irstmt).
+
+.decl IRTACNOP(stmt: IRStatement)
+IRTACNOP(irstmt) :-
+  postTrans.TACNOP(stmt),
+  Statement_IRStatement(stmt, _, irstmt).
+
+/***********
+ * Identify actual function calls and returns
+ ***********/
+
+.decl FunctionCallStmt(irstmt: IRStatement)
+FunctionCallStmt(irstmt) :-
+  Block_IRBlock(block, func, irblock),
+  IRFunctionCall(irblock, _),
+  postTrans.BasicBlock_Tail(block, stmt),
+  Statement_IRStatement(stmt, func, irstmt).
+
+.decl FunctionReturnStmt(irstmt: IRStatement)
+FunctionReturnStmt(irstmt) :-
+  Block_IRBlock(block, func, irblock),
+  IRFunction_Return(_, irblock),
+  postTrans.BasicBlock_Tail(block, stmt),
+  Statement_IRStatement(stmt, func, irstmt).
+
+.decl IRStatement_Opcode(stmt: IRStatement, op: Opcode)
+IRStatement_Opcode(irstmt, op) :-
+  postTrans.Statement_Opcode(stmt, op),
+  Statement_IRStatement(stmt, _, irstmt),
+  !FunctionCallStmt(irstmt),
+  !FunctionReturnStmt(irstmt).
+
+IRStatement_Opcode(irstmt, "CALLPRIVATE") :-
+  FunctionCallStmt(irstmt).
+
+IRStatement_Opcode(irstmt, "RETURNPRIVATE") :-
+  FunctionReturnStmt(irstmt).
+
+.decl IRIsJump(stmt: IRStatement)
+IRIsJump(irstmt) :-
+  postTrans.IsJump(stmt),
+  Statement_IRStatement(stmt, _, irstmt).
+
+
+.decl IRBasicBlock_Tail(block: IRBlock, tail: IRStatement)
+IRBasicBlock_Tail(irblock, irtail) :-
+  postTrans.BasicBlock_Tail(block, tail),
+  Block_IRBlock(block, func, irblock),
+  Statement_IRStatement(tail, func, irtail),
+  IRStatement_Block(irtail, irblock).
+
+
+// Also translating concepts of how a block uses the stack
+.decl IRBlockPopDelta(from: IRBlock, n: number)
+.decl IRBlockStackDelta(from: IRBlock, stackDelta: number)
+
+IRBlockPopDelta(irblock, n) :-
+  postTrans.BlockPopDelta(block, n),
+  Block_IRBlock(block, _, irblock).
+
+IRBlockStackDelta(irblock, stackDelta) :-
+  postTrans.BlockStackDelta(block, stackDelta),
+  Block_IRBlock(block, _, irblock).
+
+.decl IRStatement_Uses_Local(stmt: IRStatement, varOrStackIndex: VariableOrStackIndex, n: StackIndex)
+IRStatement_Uses_Local(irstmt, varOrStackIndex, n) :-
+  postTrans.Statement_Uses_Local(stmt, varOrStackIndex, n),
+  Statement_IRStatement(stmt, _, irstmt).
+
+.decl IRBeforeLocalStackContents(stmt: IRStatement, n:StackIndex, varOrStackIndex:VariableOrStackIndex)
+IRBeforeLocalStackContents(irstmt, n, varOrStackIndex) :-
+  postTrans.BeforeLocalStackContents(stmt, n, varOrStackIndex),
+  Statement_IRStatement(stmt, _, irstmt).
+
+.decl IRLocalStackContents(stmt: IRStatement, n:StackIndex, varOrStackIndex:VariableOrStackIndex)
+IRLocalStackContents(irstmt, n, varOrStackIndex) :-
+  postTrans.LocalStackContents(stmt, n, varOrStackIndex),
+  Statement_IRStatement(stmt, _, irstmt).
+
+
+/***********
+ * Discovery of arguments accepted by a function   
+ ***********/
+
+// New Instructions
+// CALLPRIVATE(stmt, function)
+// RETURNPRIVATE(stmt)
+
+.decl NumberOfFunctionArguments(func: IRFunction, num: StackIndex)
+.decl NumberOfFunctionReturnArguments(func: IRFunction, num: StackIndex)
+
+// In the functional IR we have more kinds of (local) edges than in the TAC IR:
+//  - Call-return edges from a block that ends in a call to the purported
+//    continuation of the call
+//  - Call edges that don't return (shown as edges to "invalid")
+//  - return edges (also to "invalid")
+//  - throw/exit edges (also to "invalid")
+// We need to extend the stack-manipulation predicates for all those. Care
+// should be taken for conditional calls.
+
+// How many (max) elements are popped from the stack during this block transition?
+.decl FunctionalBlockPopDelta(from: IRBlock, delta: number)
+
+// Not a function call case
+FunctionalBlockPopDelta(from, delta) :-
+  IRBlockPopDelta(from, delta),
+  !IRFunctionCall(from, _).
+
+
+// The function needs n args, the caller block pops m and leaves the
+// stack with d more than it found. This means n-d of the arguments
+// are above the stack line the block got when it started.
+
+// Case 1: If n-d >= m, then the combination block+call consumes
+// (max) n-d stack elements, relative to the stack level at beginning
+// of the caller block.
+// Case 2: If n-d < m, then the combination block+call consumes m
+// stack elements, relative to the stack level at beginning of the
+// caller block.
+FunctionalBlockPopDelta(from, newPopDelta) :-
+  IRBlockPopDelta(from, popDelta),
+  IRFunctionCall(from, func),
+  PossibleImpreciseNumberOfFunctionArguments(func, n_args),
+  IRBlockStackDelta(from, stackDelta),
+  newPopDelta = max(n_args - stackDelta, popDelta),
+  CheckIsPopDelta(newPopDelta).
+
+
+// What is the total difference in stack level during this block ?
+.decl FunctionalBlockStackDelta(from: IRBlock, delta: number)
+
+// Not a call
+FunctionalBlockStackDelta(from, stackDelta) :-
+  !IRFunctionCall(from, _),
+  IRBlockStackDelta(from, stackDelta).
+
+// It's a call-with-return edge
+FunctionalBlockStackDelta(from, newStackDelta) :-
+  IRFunctionCallReturn(from, func, _),
+  IRFunction_Return(func, ret),
+  PossibleCombinedNumberOfFunctionReturnsAndArguments(func, ret, n_args, n_ret),
+  IRBlockStackDelta(from, stackDelta),
+  newStackDelta = stackDelta - n_args + n_ret,
+  CheckIsStackDelta(newStackDelta).
+
+// What about calls with no return? These don't get back to the
+// caller, so we never care about the level they leave the stack at,
+// only about how deep in it they went.
+
+.type Path <: symbol
+
+// What's the total pop and stack delta since the beginning of the
+// function for cycle-free paths? 
+.decl PossibleFunctionalBlockPopAndStackDelta(func: IRFunction, from: IRBlock, path: Path, popDelta: number, stackDelta: number)
+
+// Another auxiliary for optimization: avoid join in key innermost loop
+.decl FunctionalBlockPopAndStackDelta(from: IRBlock, popDelta: number, stackDelta: number)
+FunctionalBlockPopAndStackDelta(from, popDelta, stackDelta) :-
+  FunctionalBlockPopDelta(from, popDelta),
+  FunctionalBlockStackDelta(from, stackDelta).
+.plan 1:(2,1)
+
+PossibleFunctionalBlockPopAndStackDelta(from, from, initPath, 0, 0) :-
+   IRFunctionEntry(from),
+   initPath = as(from, Path).
+
+.decl PotentialCycleEntry(block: IRBlock)
+
+PotentialCycleEntry(block) :-
+   LocalBlockEdge(prev, block),
+   LocalBlockEdge(prev2, block),
+//   !LocalBlockEdge(prev, prev2),
+//   !LocalBlockEdge(prev2, prev),
+   prev != prev2.
+
+
+// rules added for optimization purposes
+.decl PotentialCycleEntryLocalBlockEdge(from: IRBlock, to: IRBlock)
+
+PotentialCycleEntryLocalBlockEdge(from, to) :-
+   LocalBlockEdge(from, to),
+   PotentialCycleEntry(to).
+
+.decl NotCycleEntryLocalBlockEdge(from: IRBlock, to: IRBlock)
+NotCycleEntryLocalBlockEdge(from, to) :-
+   LocalBlockEdge(from, to),
+   !PotentialCycleEntry(to).
+
+
+PossibleFunctionalBlockPopAndStackDelta(func, to, newPath, newPopDelta, newStackDelta) :-
+  PossibleFunctionalBlockPopAndStackDelta(func, from, prevPath, prevPopDelta, prevStackDelta),
+  ((PotentialCycleEntryLocalBlockEdge(from, to), newPath = as(@add_set(prevPath, to), Path), newPath != prevPath) ;
+    (NotCycleEntryLocalBlockEdge(from, to), newPath = prevPath)),
+  FunctionalBlockPopAndStackDelta(from, popDelta, stackDelta),
+  newStackDelta = stackDelta + prevStackDelta,
+  newPopDelta = max(popDelta - prevStackDelta, prevPopDelta),
+  CheckIsPopDelta(newPopDelta), CheckIsStackDelta(newStackDelta).
+  .plan 1:(3,2,1)
+
+// Basic blocks that need to be checked for cycles in path sensitive algorithms
+.decl CycleEntry(func: IRFunction, block: IRBlock)
+
+CycleEntry(func, to) :-
+   PossibleFunctionalBlockPopAndStackDelta(func, from, path, _, _),
+   LocalBlockEdge(from, to),
+   @in_set(to, path) > 0.
+   
+// We also need to factor in blocks that we have not been able to reach
+CycleEntry(func, block) :-
+   PotentialCycleEntry(block),
+   IRInFunction(block, func),
+   !PossibleFunctionalBlockPopAndStackDelta(func, block, _, _, _).
+
+/**
+  Combine both relative to a single terminal point, for precision.
+  We need to go one edge back to make sure it's a terminal point
+  (return, call-with-no-return, or throw, possibly conditionally),
+  then add the delta again. Tedious.
+*/
+.decl PossibleCombinedNumberOfFunctionReturnsAndArguments(func: IRFunction, terminal: IRBlock, numArg: StackIndex, numRet: StackIndex)
+
+PossibleCombinedNumberOfFunctionReturnsAndArguments(func, terminal, as(numArg, StackIndex), numRet) :-
+  PossibleFunctionalBlockPopAndStackDelta(func, terminal, _, prevPopDelta, prevStackDelta),
+  FunctionalBlockPopAndStackDelta(terminal, popDelta, stackDelta),
+  numArg = max(popDelta - prevStackDelta, prevPopDelta),
+  CheckIsPopDelta(numArg),
+  numRet = prevStackDelta + stackDelta + numArg,
+  CheckIsStackIndex(numRet).
+    // When leaving the stack with d more items but it originally
+    // contained a args, the total number of returned values is d+a.
+ .plan 1:(2,1)
+
+
+/**
+  Simple, imprecise over-estimate computation that doesn't incur
+  cycle-through-aggregation problem, so it can be used in edge
+  inferences.
+*/
+.decl PossibleImpreciseNumberOfFunctionArguments(func: IRFunction, num: StackIndex)
+PossibleImpreciseNumberOfFunctionArguments(func, numArg) :-
+  PossibleCombinedNumberOfFunctionReturnsAndArguments(func, _, numArg, _).
+
+
+// Our more precise inferences
+.decl PossibleNumberOfFunctionArguments(func: IRFunction, num: StackIndex)
+.decl PossibleNumberOfFunctionReturnArguments(func: IRFunction, num: StackIndex)
+
+// Either a call with no return, or a return, or a throw: all are valid
+PossibleNumberOfFunctionArguments(func, n) :-
+  IRInFunction(block, func),
+  // Having no local block edge from it should be enough,
+  // but we can now having edges from return blocks for completeness REVIEW at some point
+  (!LocalBlockEdge(block, _) ; IRFunction_Return(func, block)),
+  n = min numArg: PossibleCombinedNumberOfFunctionReturnsAndArguments(func, block, numArg, _).
+
+PossibleNumberOfFunctionReturnArguments(func, n) :-
+  IRFunction_Return(func, ret),
+  n = min numRet: PossibleCombinedNumberOfFunctionReturnsAndArguments(func, ret, _, numRet).
+  
+  
+// REVIEW: do we need defaults of 0? I don't see why. But it won't hurt as
+// long as we are taking the max.
+PossibleNumberOfFunctionArguments(func, 0),
+PossibleNumberOfFunctionReturnArguments(func, 0) :-
+  IRFunctionEntry(func).
+
+NumberOfFunctionArguments("0x0", 0).
+
+NumberOfFunctionArguments(func, n) :-
+  IRFunctionEntry(func),
+  func != "0x0",
+  n = max m : PossibleNumberOfFunctionArguments(func, m).
+
+NumberOfFunctionReturnArguments(func, n) :-
+  IRFunctionEntry(func),
+  n = max m : PossibleNumberOfFunctionReturnArguments(func, m).
+
+
+.decl Variable_String(var:Variable, var_rep:symbol)
+
+.decl Variable_Stmt_String(var:Variable, stmt: IRStatement, var_rep:symbol) inline
+
+Variable_Stmt_String(var, stmt, res) :-
+   res = cat(stmt_str, var_str),
+   IRStatement_VarString(stmt, stmt_str),
+   Variable_String(var, var_str).
+        
+.decl Variable_Block_String(var:Variable, block: IRBlock, var_rep:symbol) inline
+
+Variable_Block_String(var, block, res) :-
+   res = cat(block_str, var_str),
+   IRBlock_VarString(block, block_str),
+   Variable_String(var, var_str).
+
+
+.decl FunctionArgument(func: IRFunction, n: StackIndex, var: Variable)
+.decl FunctionCallReturnArgument(func: IRBlock, n: StackIndex, var: Variable)
+
+.decl FunctionalStatement_Uses_Local(stmt: IRStatement, var:VariableOrStackIndex, n:StackIndex)
+.decl FunctionalStatement_Uses(stmt:IRStatement, var:Variable, n:StackIndex)
+.decl FunctionalStatement_Defines(callStmt:IRStatement, newVar:Variable, n: number)
+
+Variable_String(var, var_rep) :-
+   postTrans.Statement_Defines(var_rep, var).
+
+Variable_String(var, cat(func, cat("arg", @number_to_hex(n)))),
+FunctionArgument(func, n, var) :-
+//// REVIEW
+//  PossibleNumberOfFunctionArguments(func, n_args),
+  FunctionArgumentIndices(func, n),
+  FRESH_VARIABLE(var, as(func, IRStatement), n). // TODO: use entry?
+
+.decl FunctionArgumentIndices(func: IRFunction, n: StackIndex)
+
+FunctionArgumentIndices(func, n) :-
+  NumberOfFunctionArguments(func, n_args),
+  IsStackIndexLessThan(n, n_args).
+
+
+Variable_String(newVar, cat(callStmtBefore, cat("_", @number_to_hex(n)))),
+FunctionalStatement_Defines(callStmt, newVar, n),
+FunctionCallReturnArgument(caller, n, newVar) :-
+  IRFunctionCall(caller, func),
+//// REVIEW
+  FunctionReturnArgumentIndices(func, n),
+  IRBasicBlock_Tail(caller, callStmt),
+  Statement_IRStatement(callStmtBefore, _ ,callStmt),
+  FRESH_VARIABLE(newVar, callStmt, n).
+
+.decl FunctionReturnArgumentIndices(func: IRFunction, n: StackIndex)
+
+FunctionReturnArgumentIndices(func, n) :-
+  NumberOfFunctionReturnArguments(func, n_args),
+  IsStackIndexLessThan(n, n_args).
+
+// Renaming variables in functions
+// Involves Propagating variables, but doesn't require re-computing the CFG
+.decl FunctionalBlockInputContents(block: IRBlock, index: StackIndex, var: Variable)
+.decl FunctionalBlockOutputContents(block: IRBlock, index: StackIndex, var: Variable)
+
+FunctionalBlockInputContents(entry, n, var) :-
+   IRFunctionEntry(entry),
+   IRInFunction(entry, func),
+   FunctionArgument(func, n, var).
+
+FunctionalBlockInputContents(next, index, variable) :-
+   FunctionalBlockOutputContents(from, index, variable),
+   LocalBlockEdge(from, next).
+
+// 1) Normal block to block flow, i.e. no unconditional function calls from block to block
+FunctionalBlockOutputContents(block, index, variable) :-
+  BeforeFunctionCallFunctionalBlockOutputContents(block, index, variable),
+  LocalBlockEdge(block, next),
+  IRBlockEdge(block, next).
+
+// 2) First block calls a function, take return args from function call
+
+FunctionalBlockOutputContents(caller, n, newVar) :-
+   FunctionCallReturnArgument(caller, n, newVar).
+
+// 3) First block calls a function, take any remaining variables that have
+//    not been passed as arguments, and shift
+FunctionalBlockOutputContents(caller, newIndex, variable) :-
+   BeforeFunctionCallFunctionalBlockOutputContents(caller, index, variable),
+   IRFunctionCallReturn(caller, func, _),
+//   PossibleCombinedNumberOfFunctionReturnsAndArguments(func, n_in, n_out),
+////REVIEW
+   NumberOfFunctionReturnArguments(func, n_out),
+   NumberOfFunctionArguments(func, n_in),
+   index >= n_in,
+   newIndex = index+n_out-n_in,
+   CheckIsStackIndex(newIndex).
+
+.decl BeforeFunctionCallFunctionalBlockOutputContents(caller: IRBlock, index: StackIndex, variable: Variable)
+
+// Copy the stack variables untouched by the callee basic block
+BeforeFunctionCallFunctionalBlockOutputContents(callee, index+delta, variable) :-
+  FunctionalBlockInputContents(callee, index, variable),
+  index >= calleePopLen,
+  index+delta <= MAX_STACK_HEIGHT,
+  IRBlockPopDelta(callee, calleePopLen),
+  IRBlockStackDelta(callee, delta).
+
+// Handle the proper variables pushed by this basic block
+BeforeFunctionCallFunctionalBlockOutputContents(block, index, as(var, Variable)) :-
+  IRInFunction(block, _),
+  IRBasicBlock_Tail(block, stmt),
+  IRLocalStackContents(stmt, index, var),
+  CheckIsVariable(var).
+
+// Handle the stackIndexes pushed by this basic block
+BeforeFunctionCallFunctionalBlockOutputContents(block, index, realVariable) :-
+  FunctionalBlockInputContents(block, stackIndex, realVariable),
+  IRBasicBlock_Tail(block, stmt),
+  IRLocalStackContents(stmt, index, stackIndex),
+  CheckIsStackIndex(stackIndex).
+
+
+// TODO, check case for function call
+FunctionalStatement_Uses_Local(stmt, varOrStackIndex, n) :-
+  IRFunctionCall(block, func),
+  IRBasicBlock_Tail(block, stmt),
+  IRStatement_Opcode(stmt, opcode),
+  OpcodePopWords(opcode, m),
+//// REVIEW
+//  PossibleNumberOfFunctionArguments(func, n_in),
+  NumberOfFunctionArguments(func, n_in),
+  IsStackIndexLessThan(n, m+n_in),
+  IRBeforeLocalStackContents(stmt, n, varOrStackIndex).
+
+// TODO, check case for function return
+FunctionalStatement_Uses_Local(stmt, varOrStackIndex, n) :-
+//// REVIEW
+  NumberOfFunctionReturnArguments(func, n_out),
+  IRFunction_Return(func, retBlock),
+  IRBasicBlock_Tail(retBlock, stmt),
+  IRStatement_Opcode(stmt, opcode),
+  OpcodePopWords(opcode, m),
+  IsStackIndexLessThan(n, m+n_out),
+  IRBeforeLocalStackContents(stmt, n, varOrStackIndex).
+
+FunctionalStatement_Uses_Local(irstmt, varOrStackIndex, n) :-
+   postTrans.Statement_Uses_Local(stmt, varOrStackIndex, n),
+   Statement_IRStatement(stmt, _, irstmt).
+
+FunctionalStatement_Uses(irstmt, as(var, Variable), n) :-
+   postTrans.Statement_Uses_Local(stmt, var, n),
+   CheckIsVariable(var),
+   Statement_IRStatement(stmt, _, irstmt).
+
+FunctionalStatement_Defines(irstmt, newVar, 0) :-
+   postTrans.Statement_Defines(stmt, newVar),
+   Statement_IRStatement(stmt, _, irstmt).
+
+// Case: variable originates elsewhere
+FunctionalStatement_Uses(stmt, var, n) :-
+   IRStatement_Uses_Local(stmt, stackIndex, n),
+   CheckIsStackIndex(stackIndex),
+   IRStatement_Block(stmt, block),
+   FunctionalBlockInputContents(block, stackIndex, var).
+
+.decl PublicFunctionSignature(hex_signature: symbol, text_signature: symbol)
+.input PublicFunctionSignature
+
+.decl HighLevelFunctionName(func: IRFunction, name: symbol)
+
+// Standardize public function signature length
+.decl SighashIntermediate(sig: symbol, sigHash: symbol)
+
+SighashIntermediate(sigIn, cat("0x0",substr(sigOut,2,8))) :-
+   SighashIntermediate(sigIn, sigOut),
+   strlen(sigOut) < 10.
+
+SighashIntermediate(sig, sig) :-
+   postTrans.PublicFunction(_, sig).
+
+.decl IRPublicFunction(irfunc: IRFunction, sigHash: Value)
+IRPublicFunction(irfunc, sigHash) :-
+  PublicFunctionFiltered(func, sigHash),
+  Function_IRFunction(func, irfunc).
+  
+.decl PublicFunction_HighLevel(func: IRFunction, sigHashOut: symbol)
+PublicFunction_HighLevel(func, sigHashOut) :-
+   IRPublicFunction(func, sigHash),
+   SighashIntermediate(sigHash, sigHashOut),
+   strlen(sigHashOut) = 10.
+   
+HighLevelFunctionName(func, name) :-
+   PublicFunction_HighLevel(func, sigHash),
+   PublicFunctionSignature(sigHash, name).
+
+HighLevelFunctionName(func, name) :-
+   PublicFunction_HighLevel(func, name),
+   !PublicFunctionSignature(name, _).
+
+HighLevelFunctionName(func, func) :-
+   IRFunctionEntry(func),
+   func != "0x0",
+   !IRPublicFunction(func, _).
+
+HighLevelFunctionName(FUNCTION_SELECTOR, "__function_selector__").

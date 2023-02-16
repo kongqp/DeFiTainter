@@ -1,0 +1,184 @@
+#pragma once
+
+#include "memory_modeling/memory_modeling.dl"
+#include "data_structures.dl"
+#include "flows.dl"
+
+// TODO: Add some kind of Mask Flow to avoid using DataFlows all over the place
+
+/**
+  Models popular guarding patterns in smart contracts.
+  Some examples:
+   - `require(msg.sender == storageVar)`
+   - `require(msg.sender == 0x412312...12a3f1)`
+   - `require(msg.sender == address(this))`
+   - `require(msg.sender == storageVar.owner())`
+*/
+.decl StaticallyGuardedBlock(guardedBlock: Block, globalVal: Value)
+
+StaticallyGuardedBlock(guardedBlock, globalVal) :-
+  ControlsWith(_, guardedBlock, predicate),
+  SenderGuard(globalVal, predicate).
+
+.decl EQVars(a: Variable, b: Variable, res: Variable)
+
+EQVars(a, b, res) :-
+   EQ(_, a, b, res) ; EQ(_, b, a, res).
+
+// Internal relation, used by `StaticallyGuardedBlock`
+.decl SenderGuard(globalVal: Value, predicate: Variable)
+
+SenderGuard(cat("CONSTANT_", val), predicate) :-
+  (CALLER(_, msgsenderFrom) ; ORIGIN(_, msgsenderFrom)),
+  DataFlows(msgsenderFrom, msgsender),
+  EQVars(const, msgsender, predicateFrom),
+  Variable_Value(const, val),
+  DataFlows(predicateFrom, predicate).
+
+SenderGuard(globalVal, predicate) :-
+  (CALLER(_, msgsenderFrom) ; ORIGIN(_, msgsenderFrom)),
+  DataFlows(msgsenderFrom, msgsender),
+  EQVars(global, msgsender, predicateFrom),
+  LoadGlobalVariable(_, globalVal, globalFrom),
+  DataFlows(globalFrom, global),
+  DataFlows(predicateFrom, predicate).
+
+#ifdef DATA_STRUCTURE_SUPPORT
+SenderGuard(dataId, predicate) :-
+  (CALLER(_, msgsenderFrom) ; ORIGIN(_, msgsenderFrom)),
+  DataFlows(msgsenderFrom, msgsender),
+  LoadFromDataStructure(_, dataId, msgsender, inop_result),
+  DataFlows(inop_result, predicate).
+
+SenderGuard(dataId, predicate) :-
+  (CALLER(_, msgsenderFrom) ; ORIGIN(_, msgsenderFrom)),
+  DataFlows(msgsenderFrom, msgsender),
+  EQVars(constDataStrLoad, msgsender, predicateFrom),
+  LoadFromDataStructure(_, dataId, constVar, constDataStrLoadFrom),
+  Variable_Value(constVar, _),
+  DataFlows(constDataStrLoadFrom, constDataStrLoad),
+  DataFlows(predicateFrom, predicate).
+#endif
+
+#ifdef MEMORY_MODELING_SUPPORT
+
+SenderGuard(globalVal, predicate) :-
+  (CALLER(_, msgsenderFrom) ; ORIGIN(_, msgsenderFrom)),
+  DataFlows(msgsenderFrom, msgsender),
+  EQVars(callReturn, msgsender, predicateFrom),
+  LoadGlobalVariable(_, globalVal, globalFrom),
+  DataFlows(globalFrom, global),
+  Statement_Uses(call, global, 1),
+  ExternalCall_NumOfArgs(call, 0),
+  ExternalCall_ActualReturn(call, callReturnFrom, _),
+  DataFlows(callReturnFrom, callReturn),
+  DataFlows(predicateFrom, predicate).
+
+SenderGuard(globalVal, predicate) :-
+  (CALLER(_, msgsenderFrom) ; ORIGIN(_, msgsenderFrom)),
+  DataFlows(msgsenderFrom, msgsender),
+  StatementUsesMemory_ActualMemoryArg(call, _, 1, msgsender),
+  ExternalCall_NumOfArgs(call, 1),
+  Statement_Uses(call, global, 1),
+  DataFlows(globalFrom, global),
+  LoadGlobalVariable(_, globalVal, globalFrom),
+  ExternalCall_ActualReturn(call, callReturnFrom, _),
+  DataFlows(callReturnFrom, predicate).
+
+#endif
+
+           
+SenderGuard("this", predicate) :-
+  CALLER(_, msgsenderFrom),
+  DataFlows(msgsenderFrom, msgsender),
+  EQVars(this, msgsender, predicateFrom),
+  DataFlows(thisFrom, this),
+  ADDRESS(_, thisFrom),
+  DataFlows(predicateFrom, predicate).
+
+
+.decl UnguardedGlobalBlockEdge(from: Block, to: Block)
+
+UnguardedGlobalBlockEdge(block, next) :-
+   GlobalBlockEdge(block, next),
+   !StaticallyGuardedBlock(block, _),
+   !StaticallyGuardedBlock(next, _).
+
+/**
+  Reentrancy Guard Logic
+  This is made to model the OZ-style ReentrancyGuard.
+
+  A top-level storage variable is inferred to be a `ReentrancyGuard` if:
+   - Constant values are always stored to it
+   - Each store is followed by another one
+   - Every use of it (two stores), always stores the same two values in the same order
+
+  Right now in practise its good enough.  
+  __TODO:__ Also have the first store be controlled by the appropriate require() guard.
+**/
+
+.decl ReentrancyGuard(globalVar: Value)
+
+// Constant value stored to storage variable
+.decl StoreValueToGlobalVariable(stmt: Statement, globalVar: Value, storedVal: Value)
+
+StoreValueToGlobalVariable(stmt, globalVar, storedVal):-
+  StoreGlobalVariable(stmt, globalVar, var),
+  Variable_Value(var, storedVal).
+
+/**
+  HACK to cover cases where the "0" value stored is not stored in a val.
+  Need to make it cleaner at some later point.
+*/
+StoreValueToGlobalVariable(stmt, globalVar, "0x0"):-
+  StoreGlobalVariable(stmt, globalVar, "0xNoVar").
+
+/*
+  Instantiation of MayHappenBeforeGlobalWithArg to detect consecutive stores of constant values to global variables.
+*/
+.init storeAfterStore = MayHappenBeforeGlobalWithArg
+storeAfterStore.Before(before, globalVar):- StoreValueToGlobalVariable(before, globalVar, _).
+storeAfterStore.After(after, globalVar):- StoreValueToGlobalVariable(after, globalVar, _).
+
+.decl NotReentrancyGuard(globalVar: Value)
+
+
+ReentrancyGuard(globalVar):-
+  GlobalVariable(globalVar),
+  !NotReentrancyGuard(globalVar).
+
+NotReentrancyGuard(globalVar):-
+  GlobalVariable(globalVar),
+  !StoreGlobalVariable(_, globalVar, _).
+
+NotReentrancyGuard(globalVar):-
+  StoreGlobalVariable(stmt, globalVar, _),
+  !StoreValueToGlobalVariable(stmt, globalVar, _).
+
+NotReentrancyGuard(globalVar):-
+  StoreValueToGlobalVariable(stmt, globalVar, _),
+  !storeAfterStore.MayHappenBefore(stmt, _, globalVar),
+  !storeAfterStore.MayHappenBefore(_, stmt, globalVar).
+
+NotReentrancyGuard(globalVar):-
+  storeAfterStore.MayHappenBefore(stmt, _, globalVar),
+  storeAfterStore.MayHappenBefore(stmt2, _, globalVar),
+  StoreValueToGlobalVariable(stmt, globalVar, storedVal),
+  StoreValueToGlobalVariable(stmt2, globalVar, storedVal2),
+  storedVal != storedVal2.
+
+NotReentrancyGuard(globalVar):-
+  storeAfterStore.MayHappenBefore(_, stmt, globalVar),
+  storeAfterStore.MayHappenBefore(_, stmt2, globalVar),
+  StoreValueToGlobalVariable(stmt, globalVar, storedVal),
+  StoreValueToGlobalVariable(stmt2, globalVar, storedVal2),
+  storedVal != storedVal2.
+
+
+/*
+  Instantiation of MayHappenInBetweenGlobal used to recognize external calls that are protected by reentrancy guards.
+*/
+.init callBetweenReentrancyGuardStores = MayHappenInBetweenGlobal
+callBetweenReentrancyGuardStores.Before(before):- ReentrancyGuard(globalVar), storeAfterStore.MayHappenBefore(before, _, globalVar).
+callBetweenReentrancyGuardStores.Between(between):- CALL(between, _, _, _, _, _, _, _, _).
+callBetweenReentrancyGuardStores.After(after):- ReentrancyGuard(globalVar), storeAfterStore.MayHappenBefore(_, after, globalVar).
