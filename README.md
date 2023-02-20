@@ -22,6 +22,12 @@ Then, run DeFiTainter with the following incantation:
 The test cases in the paper can be found in the `./dataset` folder. Within 2 minutes, the result will be output to the screen. It may take a long time to use it for the first time due to compilation.
 
 
+## Datasets
+
+The `./dataset` folder contains the following datasets:
+
+- `incident.csv`: 23 DeFi protocols exploited in real-world price manipulation attacks.
+- `high_value.csv`: 1195 high-value DeFi protocols.
 
 
 
